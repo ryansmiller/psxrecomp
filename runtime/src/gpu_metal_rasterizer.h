@@ -26,6 +26,7 @@ enum {
     PSX_METAL_FLAT = 0,            /* color: 15-bit color */
     PSX_METAL_SPRITE = 1,          /* texel (u + col / w, v + row / w) */
     PSX_METAL_SCALED_SPRITE = 2,   /* texel (u + du * col / w, v + dv * row / h) */
+    PSX_METAL_GOURAUD = 3,         /* colour from the entry's row attributes */
 };
 
 /* All fields are 32-bit so the Metal struct has the same layout.
@@ -39,9 +40,16 @@ typedef struct {
     int32_t x, y, u, v, w, h, du, dv;
 } PsxMetalPrimitive;
 
+/* attr indexes the batch's row attributes for kinds that need them. */
 typedef struct {
-    uint32_t row, x, width, primitive;
+    uint32_t row, x, width, primitive, attr;
 } PsxMetalEntry;
+
+/* A Gouraud row: unclipped edges xa..xb and 5-bit edge colours, exactly as
+ * gpu_sw_renderer.c's gouraud_row computes them. */
+typedef struct {
+    int32_t xa, span, ra, ga, ba, rb, gb, bb;
+} PsxMetalRowAttr;
 
 /* Drops any shared Metal buffer wrapping memory before it is freed. */
 void psx_metal_forget_memory(const void *memory);
@@ -60,6 +68,7 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
                          const PsxMetalPrimitive *primitives,
                          uint32_t primitive_count,
                          const PsxMetalEntry *entries, uint32_t entry_count,
+                         const PsxMetalRowAttr *attrs, uint32_t attr_count,
                          unsigned char *dirty_rows);
 
 #endif

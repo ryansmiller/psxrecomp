@@ -56,8 +56,9 @@ static NSString *const batch_shader =
     "    uint kind, color, blend, flags, texpage, clut, window;\n"
     "    int x, y, u, v, w, h, du, dv;\n"
     "};\n"
-    "struct Entry { uint x, width, primitive; };\n"
+    "struct Entry { uint x, width, primitive, attr; };\n"
     "struct Row { uint pixel, x, width, first, count, y; };\n"
+    "struct Attr { int xa, span, ra, ga, ba, rb, gb, bb; };\n"
     /* gpu_sw_renderer.c vram_get and texel_fetch: VRAM wraps at 1024x512. */
     "static uint vram_get(device const ushort *vram, int x, int y) {\n"
     "    return vram[uint(y & 511) * 1024u + uint(x & 1023)];\n"
@@ -104,6 +105,7 @@ static NSString *const batch_shader =
     "                         constant Primitive *primitives [[buffer(3)]],\n"
     "                         device atomic_uint *dirty [[buffer(4)]],\n"
     "                         device const ushort *vram [[buffer(5)]],\n"
+    "                         constant Attr *attrs [[buffer(6)]],\n"
     "                         uint2 xy [[thread_position_in_grid]]) {\n"
     "    Row row = rows[xy.y];\n"
     "    if (xy.x >= row.width) return;\n"
@@ -119,6 +121,20 @@ static NSString *const batch_shader =
     "        bool semi;\n"
     "        if (p.kind == 0u) {\n"
     "            result = p.color;\n"
+    "            semi = true;\n"
+    /* gpu_sw_renderer.c raster_gouraud_triangle, per pixel. Safe math keeps
+     * the float division and products identical to the CPU. */
+    "        } else if (p.kind == 3u) {\n"
+    "            Attr a = attrs[entry.attr];\n"
+    "            if (a.span > 0) {\n"
+    "                float tf = float(int(x) - a.xa) / float(a.span);\n"
+    "                int r = clamp(a.ra + int(float(a.rb - a.ra) * tf), 0, 31);\n"
+    "                int g = clamp(a.ga + int(float(a.gb - a.ga) * tf), 0, 31);\n"
+    "                int b = clamp(a.ba + int(float(a.bb - a.ba) * tf), 0, 31);\n"
+    "                result = uint(r | (g << 5) | (b << 10));\n"
+    "            } else {\n"
+    "                result = uint(a.ra | (a.ga << 5) | (a.ba << 10));\n"
+    "            }\n"
     "            semi = true;\n"
     "        } else {\n"
     "            int col = int(x) - p.x, line = int(row.y) - p.y;\n"
@@ -159,7 +175,7 @@ static NSString *const batch_shader =
 
 static id<MTLComputePipelineState> batch_pipeline;
 static id<MTLBuffer> batch_pixels, batch_rows, batch_entries, batch_primitives, batch_dirty;
-static id<MTLBuffer> batch_texture_vram;
+static id<MTLBuffer> batch_texture_vram, batch_attrs;
 
 static int initialize(void) {
     static int attempted;
@@ -167,12 +183,24 @@ static int initialize(void) {
         attempted = 1;
         device = MTLCreateSystemDefaultDevice();
         NSError *error = nil;
-        id<MTLLibrary> library = [device newLibraryWithSource:shader options:nil error:&error];
+        /* Kernels must round like the CPU reference, which is compiled with
+         * -ffp-contract=off. Fast math changes float division results. */
+        MTLCompileOptions *options = [MTLCompileOptions new];
+        if (@available(macOS 15.0, *)) {
+            options.mathMode = MTLMathModeSafe;
+            options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+        } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            options.fastMathEnabled = NO;   /* the pre-macOS 15 equivalent */
+#pragma clang diagnostic pop
+        }
+        id<MTLLibrary> library = [device newLibraryWithSource:shader options:options error:&error];
         id<MTLFunction> function = [library newFunctionWithName:@"raster_spans"];
         if (function)
             pipeline = [device newComputePipelineStateWithFunction:function error:&error];
         id<MTLLibrary> batch_library =
-            [device newLibraryWithSource:batch_shader options:nil error:&error];
+            [device newLibraryWithSource:batch_shader options:options error:&error];
         id<MTLFunction> batch_function = [batch_library newFunctionWithName:@"raster_batch"];
         if (batch_function)
             batch_pipeline = [device newComputePipelineStateWithFunction:batch_function
@@ -298,7 +326,7 @@ void psx_metal_flush_counts(uint64_t *zero_copy, uint64_t *copied) {
 }
 
 typedef struct {
-    uint32_t x, width, primitive;
+    uint32_t x, width, primitive, attr;
 } PackedEntry;
 
 int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
@@ -306,6 +334,7 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
                          const PsxMetalPrimitive *primitives,
                          uint32_t primitive_count,
                          const PsxMetalEntry *entries, uint32_t entry_count,
+                         const PsxMetalRowAttr *attrs, uint32_t attr_count,
                          unsigned char *dirty_rows) {
     @autoreleasepool {
         if (!entry_count || rows <= 0 || !initialize()) return 0;
@@ -314,7 +343,9 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
         if (!row_counts) return 0;
         for (uint32_t i = 0; i < entry_count; ++i) {
             if (entries[i].row >= (uint32_t)rows ||
-                entries[i].primitive >= primitive_count) {
+                entries[i].primitive >= primitive_count ||
+                (primitives[entries[i].primitive].kind == PSX_METAL_GOURAUD &&
+                 entries[i].attr >= attr_count)) {
                 free(row_counts);
                 return 0;
             }
@@ -342,7 +373,7 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
         memcpy(cursor, row_counts, (size_t)rows * sizeof *cursor);
         for (uint32_t i = 0; i < entry_count; ++i) {
             const PsxMetalEntry e = entries[i];
-            sorted[cursor[e.row]++] = (PackedEntry){e.x, e.width, e.primitive};
+            sorted[cursor[e.row]++] = (PackedEntry){e.x, e.width, e.primitive, e.attr};
         }
         free(cursor);
 
@@ -406,6 +437,14 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
             texels = batch_texture_vram;
         }
         [encoder setBuffer:(texels ? texels : batch_dirty) offset:0 atIndex:5];
+        if (attr_count) {
+            if (!reserve(&batch_attrs, attr_count * sizeof(PsxMetalRowAttr))) {
+                free(row_of);
+                return 0;
+            }
+            memcpy(batch_attrs.contents, attrs, attr_count * sizeof(PsxMetalRowAttr));
+        }
+        [encoder setBuffer:(attr_count ? batch_attrs : batch_dirty) offset:0 atIndex:6];
         [encoder dispatchThreads:MTLSizeMake(max_width, row_count, 1)
            threadsPerThreadgroup:MTLSizeMake(batch_pipeline.threadExecutionWidth, 1, 1)];
         [encoder endEncoding];

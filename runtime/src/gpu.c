@@ -7833,6 +7833,7 @@ static int gp0_batch_safe(uint8_t opcode) {
         case 0x20: case 0x28:             /* monochrome triangle and quad */
         case 0x60: case 0x68: case 0x70: case 0x78: /* monochrome rectangles */
         case 0x64: case 0x6C: case 0x74: case 0x7C: /* textured rectangles */
+        case 0x30: case 0x38:             /* Gouraud triangle and quad */
             return 1;
         default:
             return opcode == 0x00 || (opcode >= 0xE1 && opcode <= 0xE6);

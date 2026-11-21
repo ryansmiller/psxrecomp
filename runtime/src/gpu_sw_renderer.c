@@ -822,6 +822,8 @@ typedef struct {
     uint32_t primitive_count, primitive_capacity;
     PsxMetalEntry *entries;
     uint32_t entry_count, entry_capacity;
+    PsxMetalRowAttr *attrs;
+    uint32_t attr_count, attr_capacity;
 } MetalBatch;
 static MetalBatch g_metal_batches[METAL_BATCH_TARGETS];
 static int g_metal_batch_depth;
@@ -919,6 +921,18 @@ static void metal_batch_apply_cpu(const MetalBatch *b, unsigned char *dirty) {
             int semi = 1;
             if (p->kind == PSX_METAL_FLAT) {
                 result = (uint16_t)p->color;
+            } else if (p->kind == PSX_METAL_GOURAUD) {
+                const PsxMetalRowAttr *a = &b->attrs[e.attr];
+                if (a->span > 0) {
+                    float tf = (float)((int)x - a->xa) / (float)a->span;
+                    int r = a->ra + (int)((float)(a->rb - a->ra) * tf);
+                    int g = a->ga + (int)((float)(a->gb - a->ga) * tf);
+                    int bl = a->ba + (int)((float)(a->bb - a->ba) * tf);
+                    r = clamp_i(r, 0, 31); g = clamp_i(g, 0, 31); bl = clamp_i(bl, 0, 31);
+                    result = (uint16_t)(r | (g << 5) | (bl << 10));
+                } else {
+                    result = (uint16_t)(a->ra | (a->ga << 5) | (a->ba << 10));
+                }
             } else {
                 const int col = (int)x - p->x, line = (int)e.row - p->y;
                 int u, v;
@@ -959,7 +973,7 @@ void sw_metal_batch_sync(void) {
     for (int i = 0; i < METAL_BATCH_TARGETS; ++i) {
         MetalBatch *b = &g_metal_batches[i];
         if (!b->entry_count) {
-            b->primitive_count = 0;
+            b->primitive_count = b->attr_count = 0;
             continue;
         }
         unsigned char dirty[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
@@ -967,12 +981,13 @@ void sw_metal_batch_sync(void) {
         if (g_metal_batch_cpu ||
             !psx_metal_draw_batch(b->buf, b->w, b->h, textured ? g_vram : NULL,
                                   b->primitives, b->primitive_count,
-                                  b->entries, b->entry_count, dirty))
+                                  b->entries, b->entry_count,
+                                  b->attrs, b->attr_count, dirty))
             metal_batch_apply_cpu(b, dirty);
         if (b->buf == g_vram)
             for (int y = 0; y < b->h; ++y)
                 if (dirty[y]) gpu_vram_dirty_mark_row((uint32_t)y);
-        b->primitive_count = b->entry_count = 0;
+        b->primitive_count = b->entry_count = b->attr_count = 0;
     }
     memset(&g_metal_writes, 0, sizeof g_metal_writes);
     memset(&g_metal_reads, 0, sizeof g_metal_reads);
@@ -1017,10 +1032,12 @@ static PsxMetalPrimitive metal_primitive(const RTarget *t, uint32_t kind, uint32
 }
 
 /* Queues one primitive's spans on t. reads, when non-NULL, is the native
- * VRAM it samples. Returns 0 when it must draw on the CPU instead; any open
- * batch has then been applied. */
+ * VRAM it samples; attrs, when non-NULL, holds one row attribute per span.
+ * Returns 0 when it must draw on the CPU instead; any open batch has then
+ * been applied. */
 static int metal_enqueue(const RTarget *t, const PsxMetalSpan *spans, int top, int height,
-                         const PsxMetalPrimitive *primitive, const MetalTiles *reads) {
+                         const PsxMetalPrimitive *primitive, const MetalTiles *reads,
+                         const PsxMetalRowAttr *attrs) {
     MetalTiles writes;
     memset(&writes, 0, sizeof writes);
     if (t->buf == g_vram) {
@@ -1063,16 +1080,24 @@ static int metal_enqueue(const RTarget *t, const PsxMetalSpan *spans, int top, i
         !metal_grow((void **)&b->primitives, &b->primitive_capacity,
                     b->primitive_count + 1u, sizeof *b->primitives) ||
         !metal_grow((void **)&b->entries, &b->entry_capacity,
-                    b->entry_count + (uint32_t)height, sizeof *b->entries)) {
+                    b->entry_count + (uint32_t)height, sizeof *b->entries) ||
+        (attrs && !metal_grow((void **)&b->attrs, &b->attr_capacity,
+                              b->attr_count + (uint32_t)height, sizeof *b->attrs))) {
         sw_metal_batch_sync();
         return 0;
     }
     const uint32_t index = b->primitive_count++;
     b->primitives[index] = *primitive;
     for (int y = 0; y < height; ++y)
-        if (spans[y].width)
+        if (spans[y].width) {
+            uint32_t attr = 0;
+            if (attrs) {
+                attr = b->attr_count++;
+                b->attrs[attr] = attrs[y];
+            }
             b->entries[b->entry_count++] =
-                (PsxMetalEntry){(uint32_t)(top + y), spans[y].x, spans[y].width, index};
+                (PsxMetalEntry){(uint32_t)(top + y), spans[y].x, spans[y].width, index, attr};
+        }
     tiles_merge(&g_metal_writes, &writes);
     if (reads) tiles_merge(&g_metal_reads, reads);
     return 1;
@@ -1092,7 +1117,7 @@ static int metal_sprite(const RTarget *t, const PsxMetalPrimitive *p, int x, int
     PsxMetalPrimitive placed = *p;
     placed.x = x;
     placed.y = y;
-    return metal_enqueue(t, spans, top, bottom - top, &placed, reads);
+    return metal_enqueue(t, spans, top, bottom - top, &placed, reads, NULL);
 }
 
 /* Batches a textured rectangle on every target, or returns 0 after applying
@@ -1151,7 +1176,7 @@ static int metal_draw(const RTarget *t, const PsxMetalSpan *spans,
                       int top, int height, uint16_t color) {
     if (g_metal_batch_depth) {
         const PsxMetalPrimitive p = metal_primitive(t, PSX_METAL_FLAT, color);
-        if (metal_enqueue(t, spans, top, height, &p, NULL)) return 1;
+        if (metal_enqueue(t, spans, top, height, &p, NULL, NULL)) return 1;
     }
     uint16_t *rows = t->buf + (size_t)top * t->w;
     unsigned char dirty[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
@@ -1266,10 +1291,71 @@ void sw_draw_flat_triangle(int x0, int y0, int x1, int y1,
 /* Gouraud-shaded triangle (scanline rasterization with color interp) */
 /* ------------------------------------------------------------------ */
 
-static void raster_gouraud_triangle(const RTarget *t,
-                                    int x0, int y0, uint16_t c0,
-                                    int x1, int y1, uint16_t c1,
-                                    int x2, int y2, uint16_t c2) {
+/* One scanline of a Gouraud triangle with vertices sorted by y: the edge
+ * x positions and 5-bit edge colours, ordered so xa <= xb. Shared by the CPU
+ * rasterizer and the Metal batch so both start every row from the same
+ * float results. */
+typedef struct {
+    int xa, xb, ra, ga, ba, rb, gb, bb;
+} GouraudRow;
+
+static GouraudRow gouraud_row(int x0, int y0, int r0, int g0, int b0,
+                              int x1, int y1, int r1, int g1, int b1,
+                              int x2, int y2, int r2, int g2, int b2, int y) {
+    GouraudRow row;
+    int dy_total = y2 - y0;
+    int second_half = (y >= y1);
+    int seg_height = second_half ? (y2 - y1) : (y1 - y0);
+    if (seg_height == 0) seg_height = 1;
+
+    float alpha = (float)(y - y0) / (float)dy_total;
+    float beta;
+    if (second_half)
+        beta = (float)(y - y1) / (float)seg_height;
+    else
+        beta = (float)(y - y0) / (float)seg_height;
+
+    /* Interpolate X along edges */
+    int xa, xb;
+    psx_triangle_edges_at_y(x0, y0, x1, y1, x2, y2, y, &xa, &xb);
+
+    /* Interpolate colors along edges (in 5-bit space) */
+    int ra = r0 + (int)((float)(r2 - r0) * alpha);
+    int ga = g0 + (int)((float)(g2 - g0) * alpha);
+    int ba = b0 + (int)((float)(b2 - b0) * alpha);
+    int rb, gb, bb;
+    if (second_half) {
+        rb = r1 + (int)((float)(r2 - r1) * beta);
+        gb = g1 + (int)((float)(g2 - g1) * beta);
+        bb = b1 + (int)((float)(b2 - b1) * beta);
+    } else {
+        rb = r0 + (int)((float)(r1 - r0) * beta);
+        gb = g0 + (int)((float)(g1 - g0) * beta);
+        bb = b0 + (int)((float)(b1 - b0) * beta);
+    }
+
+    /* Ensure xa < xb, swap colors too */
+    if (xa > xb) {
+        int tt;
+        tt = xa; xa = xb; xb = tt;
+        tt = ra; ra = rb; rb = tt;
+        tt = ga; ga = gb; gb = tt;
+        tt = ba; ba = bb; bb = tt;
+    }
+    row.xa = xa; row.xb = xb;
+    row.ra = ra; row.ga = ga; row.ba = ba;
+    row.rb = rb; row.gb = gb; row.bb = bb;
+    return row;
+}
+
+/* Sorts vertices by Y, keeping colors in sync, and splits 15-bit colours
+ * into 5-bit components. Returns 0 for a zero-height triangle. */
+typedef struct {
+    int x[3], y[3], r[3], g[3], b[3];
+} GouraudVerts;
+
+static int gouraud_sort(GouraudVerts *v, int x0, int y0, uint16_t c0, int x1, int y1,
+                        uint16_t c1, int x2, int y2, uint16_t c2) {
     /* Extract 5-bit color components for each vertex */
     int r0 = (c0 >>  0) & 0x1F, g0 = (c0 >>  5) & 0x1F, b0 = (c0 >> 10) & 0x1F;
     int r1 = (c1 >>  0) & 0x1F, g1 = (c1 >>  5) & 0x1F, b1 = (c1 >> 10) & 0x1F;
@@ -1288,51 +1374,31 @@ static void raster_gouraud_triangle(const RTarget *t,
         int tt; tt=x1; x1=x2; x2=tt; tt=y1; y1=y2; y2=tt;
         tt=r1; r1=r2; r2=tt; tt=g1; g1=g2; g2=tt; tt=b1; b1=b2; b2=tt;
     }
+    v->x[0] = x0; v->y[0] = y0; v->r[0] = r0; v->g[0] = g0; v->b[0] = b0;
+    v->x[1] = x1; v->y[1] = y1; v->r[1] = r1; v->g[1] = g1; v->b[1] = b1;
+    v->x[2] = x2; v->y[2] = y2; v->r[2] = r2; v->g[2] = g2; v->b[2] = b2;
+    return y2 - y0 != 0;
+}
 
-    int dy_total = y2 - y0;
-    if (dy_total == 0) return;
+static GouraudRow gouraud_row_at(const GouraudVerts *v, int y) {
+    return gouraud_row(v->x[0], v->y[0], v->r[0], v->g[0], v->b[0],
+                       v->x[1], v->y[1], v->r[1], v->g[1], v->b[1],
+                       v->x[2], v->y[2], v->r[2], v->g[2], v->b[2], y);
+}
 
-    for (int y = y0; y < y2; y++) {
+static void raster_gouraud_triangle(const RTarget *t,
+                                    int x0, int y0, uint16_t c0,
+                                    int x1, int y1, uint16_t c1,
+                                    int x2, int y2, uint16_t c2) {
+    GouraudVerts v;
+    if (!gouraud_sort(&v, x0, y0, c0, x1, y1, c1, x2, y2, c2)) return;
+
+    for (int y = v.y[0]; y < v.y[2]; y++) {
         if (y < t->cy1 || y > t->cy2) continue;
-
-        int second_half = (y >= y1);
-        int seg_height = second_half ? (y2 - y1) : (y1 - y0);
-        if (seg_height == 0) seg_height = 1;
-
-        float alpha = (float)(y - y0) / (float)dy_total;
-        float beta;
-        if (second_half)
-            beta = (float)(y - y1) / (float)seg_height;
-        else
-            beta = (float)(y - y0) / (float)seg_height;
-
-        /* Interpolate X along edges */
-        int xa, xb;
-        psx_triangle_edges_at_y(x0, y0, x1, y1, x2, y2, y, &xa, &xb);
-
-        /* Interpolate colors along edges (in 5-bit space) */
-        int ra = r0 + (int)((float)(r2 - r0) * alpha);
-        int ga = g0 + (int)((float)(g2 - g0) * alpha);
-        int ba = b0 + (int)((float)(b2 - b0) * alpha);
-        int rb, gb, bb;
-        if (second_half) {
-            rb = r1 + (int)((float)(r2 - r1) * beta);
-            gb = g1 + (int)((float)(g2 - g1) * beta);
-            bb = b1 + (int)((float)(b2 - b1) * beta);
-        } else {
-            rb = r0 + (int)((float)(r1 - r0) * beta);
-            gb = g0 + (int)((float)(g1 - g0) * beta);
-            bb = b0 + (int)((float)(b1 - b0) * beta);
-        }
-
-        /* Ensure xa < xb, swap colors too */
-        if (xa > xb) {
-            int tt;
-            tt = xa; xa = xb; xb = tt;
-            tt = ra; ra = rb; rb = tt;
-            tt = ga; ga = gb; gb = tt;
-            tt = ba; ba = bb; bb = tt;
-        }
+        const GouraudRow row = gouraud_row_at(&v, y);
+        const int xa = row.xa, xb = row.xb;
+        const int ra = row.ra, ga = row.ga, ba = row.ba;
+        const int rb = row.rb, gb = row.gb, bb = row.bb;
 
         int sx = max_i(xa, t->cx1);
         int ex = min_i(xb, t->cx2 + 1);
@@ -1358,9 +1424,56 @@ static void raster_gouraud_triangle(const RTarget *t,
     }
 }
 
+#ifdef PSX_MACOS_METAL_RASTERIZER
+/* Queues one Gouraud triangle on t with the CPU rasterizer's rows. */
+static int metal_gouraud(const RTarget *t, int x0, int y0, uint16_t c0, int x1, int y1,
+                         uint16_t c1, int x2, int y2, uint16_t c2) {
+    GouraudVerts v;
+    if (!gouraud_sort(&v, x0, y0, c0, x1, y1, c1, x2, y2, c2)) return 1;
+    /* raster_gouraud_triangle clips rows to the draw area; put_opaque also
+     * drops pixels outside the target. */
+    const int top = max_i(v.y[0], max_i(t->cy1, 0));
+    const int bottom = min_i(v.y[2], min_i(t->cy2 + 1, t->h));
+    if (bottom <= top) return 1;
+    static PsxMetalSpan spans[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
+    static PsxMetalRowAttr attrs[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
+    for (int y = top; y < bottom; ++y) {
+        const GouraudRow row = gouraud_row_at(&v, y);
+        const int sx = max_i(max_i(row.xa, t->cx1), 0);
+        const int ex = min_i(min_i(row.xb, t->cx2 + 1), t->w);
+        spans[y - top] = ex > sx ? (PsxMetalSpan){(uint32_t)sx, (uint32_t)(ex - sx)}
+                                 : (PsxMetalSpan){0, 0};
+        attrs[y - top] = (PsxMetalRowAttr){row.xa, row.xb - row.xa, row.ra, row.ga, row.ba,
+                                           row.rb, row.gb, row.bb};
+    }
+    const PsxMetalPrimitive p = metal_primitive(t, PSX_METAL_GOURAUD, 0);
+    return metal_enqueue(t, spans, top, bottom - top, &p, NULL, attrs);
+}
+#endif
+
 void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
                               int x1, int y1, uint16_t c1,
                               int x2, int y2, uint16_t c2) {
+#ifdef PSX_MACOS_METAL_RASTERIZER
+    if (g_metal_batch_depth && !g_wide_cur) {
+        RTarget n = rt_native();
+        if (metal_gouraud(&n, x0, y0, c0, x1, y1, c1, x2, y2, c2)) {
+            if (g_hr) {
+                int s = g_scale;
+                RTarget hr = rt_hires();
+                const int hx0 = precise_scaled(0,0,x0,s), hy0 = precise_scaled(1,0,y0,s);
+                const int hx1 = precise_scaled(0,1,x1,s), hy1 = precise_scaled(1,1,y1,s);
+                const int hx2 = precise_scaled(0,2,x2,s), hy2 = precise_scaled(1,2,y2,s);
+                /* The native half is queued; if the mirror cannot be, the
+                 * batch is applied and the mirror draws on the CPU. */
+                if (!metal_gouraud(&hr, hx0, hy0, c0, hx1, hy1, c1, hx2, hy2, c2))
+                    raster_gouraud_triangle(&hr, hx0, hy0, c0, hx1, hy1, c1, hx2, hy2, c2);
+            }
+            precise_consumed();
+            return;
+        }
+    }
+#endif
     METAL_BATCH_SYNC();
     RTarget n = rt_native();
     raster_gouraud_triangle(&n, x0, y0, c0, x1, y1, c1, x2, y2, c2);
