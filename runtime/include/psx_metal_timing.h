@@ -28,8 +28,11 @@ static inline uint64_t psx_metal_timing_begin(PsxMetalTimingStream *stream,
             int len = snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
             if (len > 0 && (size_t)len < sizeof(path))
                 stream->file = fopen(path, "wb");
+            /* Unbuffered: a host that is killed without running atexit
+             * handlers still leaves every span it recorded. Spans are a few
+             * hundred per second, so one write each is cheap. */
             if (stream->file)
-                setvbuf(stream->file, NULL, _IOFBF, 65536);
+                setvbuf(stream->file, NULL, _IONBF, 0);
             else
                 fprintf(stderr, "Could not open Metal timing stream %s\n", name);
         }
