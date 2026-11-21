@@ -37,6 +37,13 @@
 #ifdef PSX_MACOS_METAL_RASTERIZER
 #include "gpu_metal_rasterizer.h"
 static int g_metal_rasterizer;
+/* Applies queued Metal primitives before VRAM is read or otherwise written. */
+#define METAL_BATCH_SYNC() sw_metal_batch_sync()
+#else
+#define METAL_BATCH_SYNC() ((void)0)
+void sw_metal_batch_begin(void) {}
+void sw_metal_batch_end(void) {}
+void sw_metal_batch_sync(void) {}
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -472,6 +479,7 @@ static void sw_rect_uv_limits(int u0, int v0, int u1, int v1) {
 /* ------------------------------------------------------------------ */
 
 void sw_renderer_init(uint16_t *vram) {
+    METAL_BATCH_SYNC();
     g_vram = vram;
 #ifdef PSX_MACOS_METAL_RASTERIZER
     const char *metal = getenv("PSX_METAL_RASTERIZER");
@@ -498,6 +506,7 @@ void sw_renderer_init(uint16_t *vram) {
 /* Point the rasterizer at another VRAM array without touching any draw
  * state (the OpenGL render thread switches its upload source this way). */
 void sw_renderer_rebind_vram(uint16_t *vram) {
+    METAL_BATCH_SYNC();
     g_vram = vram;
 }
 
@@ -506,6 +515,7 @@ void sw_renderer_rebind_vram(uint16_t *vram) {
 /* ------------------------------------------------------------------ */
 
 void sw_renderer_set_scale(int scale) {
+    METAL_BATCH_SYNC();
     if (scale < 1) scale = 1;
     if (scale > SW_MAX_INTERNAL_SCALE) scale = SW_MAX_INTERNAL_SCALE;
 
@@ -541,6 +551,7 @@ int sw_renderer_scale(void) { return g_scale; }
  * each player's Display filter) into pixels the game can read back with GP0
  * C0 (V8:2 samples its own frame), forking guest RAM between peers. */
 void sw_set_faithful_authority(int on) {
+    METAL_BATCH_SYNC();
     g_faithful_authority = on ? 1 : 0;
     g_texture_filter = g_faithful_authority ? 0 : g_texture_filter_req;
     if (g_faithful_authority) {
@@ -676,6 +687,7 @@ static void hr_fill_block(int x, int y, int w, int h, uint16_t color) {
 }
 
 void sw_fill_rect(int x, int y, int w, int h, uint16_t color) {
+    METAL_BATCH_SYNC();
     /* Fill rect ignores draw area, mask bits, and semi-transparency.
      * It writes directly to VRAM with coordinates wrapping. */
     int x0 = x & (VRAM_WIDTH - 1);
@@ -698,6 +710,7 @@ void sw_fill_rect(int x, int y, int w, int h, uint16_t color) {
 /* ------------------------------------------------------------------ */
 
 void sw_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
+    METAL_BATCH_SYNC();
     uint16_t row_buf[VRAM_WIDTH];
 
     /* Hi-res scratch: one native row's worth of source super-rows. */
@@ -772,8 +785,132 @@ static PsxMetalSpan metal_span(const RTarget *t, int left, int right) {
     return end > x ? (PsxMetalSpan){x, end - x} : (PsxMetalSpan){0, 0};
 }
 
+/* Queued flat primitives, one batch per target buffer. */
+#define METAL_BATCH_TARGETS 4
+#define METAL_BATCH_MAX_ENTRIES (1u << 20)
+typedef struct {
+    uint16_t *buf;
+    int w, h;
+    PsxMetalPrimitive *primitives;
+    uint32_t primitive_count, primitive_capacity;
+    PsxMetalEntry *entries;
+    uint32_t entry_count, entry_capacity;
+} MetalBatch;
+static MetalBatch g_metal_batches[METAL_BATCH_TARGETS];
+static int g_metal_batch_depth;
+
+/* Reference executor for a batch: the same per-pixel order as the kernel.
+ * Used when Metal cannot run the batch. */
+static void metal_batch_apply_cpu(const MetalBatch *b, unsigned char *dirty) {
+    for (uint32_t i = 0; i < b->entry_count; ++i) {
+        const PsxMetalEntry e = b->entries[i];
+        const PsxMetalPrimitive p = b->primitives[e.primitive];
+        uint16_t *row = b->buf + (size_t)e.row * b->w;
+        for (uint32_t x = e.x; x < e.x + e.width; ++x) {
+            uint16_t back = row[x];
+            if ((p.flags & PSX_METAL_CHECK_MASK) && (back & 0x8000)) continue;
+            uint16_t result = p.color;
+            if (p.blend < PSX_METAL_OPAQUE) {
+                result = 0;
+                for (int shift = 0; shift < 15; shift += 5) {
+                    int bc = (back >> shift) & 31, f = (p.color >> shift) & 31, c;
+                    switch (p.blend) {
+                        case 0: c = (bc + f) >> 1; break;
+                        case 1: c = min_i(bc + f, 31); break;
+                        case 2: c = max_i(bc - f, 0); break;
+                        default: c = min_i(bc + (f >> 2), 31); break;
+                    }
+                    result |= (uint16_t)(c << shift);
+                }
+            }
+            row[x] = result | ((p.flags & PSX_METAL_SET_MASK) ? 0x8000 : 0);
+            if (p.flags & PSX_METAL_TRACK_DIRTY) dirty[e.row] = 1;
+        }
+    }
+}
+
+void sw_metal_batch_sync(void) {
+    for (int i = 0; i < METAL_BATCH_TARGETS; ++i) {
+        MetalBatch *b = &g_metal_batches[i];
+        if (!b->entry_count) {
+            b->primitive_count = 0;
+            continue;
+        }
+        unsigned char dirty[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
+        memset(dirty, 0, (size_t)b->h);
+        if (!psx_metal_draw_batch(b->buf, b->w, b->h, b->primitives, b->primitive_count,
+                                  b->entries, b->entry_count, dirty))
+            metal_batch_apply_cpu(b, dirty);
+        if (b->buf == g_vram)
+            for (int y = 0; y < b->h; ++y)
+                if (dirty[y]) gpu_vram_dirty_mark_row((uint32_t)y);
+        b->primitive_count = b->entry_count = 0;
+    }
+}
+
+void sw_metal_batch_begin(void) {
+    if (g_metal_rasterizer) ++g_metal_batch_depth;
+}
+
+void sw_metal_batch_end(void) {
+    if (g_metal_batch_depth > 0 && --g_metal_batch_depth == 0)
+        sw_metal_batch_sync();
+}
+
+static int metal_grow(void **items, uint32_t *capacity, uint32_t needed, size_t size) {
+    if (needed <= *capacity) return 1;
+    uint32_t next = *capacity ? *capacity : 1024u;
+    while (next < needed) next *= 2u;
+    void *grown = realloc(*items, (size_t)next * size);
+    if (!grown) return 0;
+    *items = grown;
+    *capacity = next;
+    return 1;
+}
+
+/* Returns 0 when the primitive must draw immediately instead. */
+static int metal_enqueue(const RTarget *t, const PsxMetalSpan *spans,
+                         int top, int height, uint16_t color) {
+    MetalBatch *b = NULL;
+    for (int i = 0; i < METAL_BATCH_TARGETS && !b; ++i)
+        if (g_metal_batches[i].buf == t->buf && g_metal_batches[i].w == t->w &&
+            g_metal_batches[i].h == t->h)
+            b = &g_metal_batches[i];
+    for (int i = 0; i < METAL_BATCH_TARGETS && !b; ++i)
+        if (!g_metal_batches[i].entry_count) {
+            b = &g_metal_batches[i];
+            b->buf = t->buf;
+            b->w = t->w;
+            b->h = t->h;
+        }
+    if (!b || b->entry_count + (uint32_t)height > METAL_BATCH_MAX_ENTRIES) {
+        sw_metal_batch_sync();
+        return 0;
+    }
+    if (!metal_grow((void **)&b->primitives, &b->primitive_capacity,
+                    b->primitive_count + 1u, sizeof *b->primitives) ||
+        !metal_grow((void **)&b->entries, &b->entry_capacity,
+                    b->entry_count + (uint32_t)height, sizeof *b->entries)) {
+        sw_metal_batch_sync();
+        return 0;
+    }
+    const uint32_t index = b->primitive_count++;
+    b->primitives[index] = (PsxMetalPrimitive){
+        color, (uint8_t)(g_semi_trans_enabled ? g_semi_trans_mode : PSX_METAL_OPAQUE),
+        (uint8_t)((g_mask_check_bit ? PSX_METAL_CHECK_MASK : 0) |
+                  (g_mask_set_bit ? PSX_METAL_SET_MASK : 0) |
+                  (t->buf == g_vram && g_psx_vram_dirty_tracking ? PSX_METAL_TRACK_DIRTY : 0))};
+    for (int y = 0; y < height; ++y)
+        if (spans[y].width)
+            b->entries[b->entry_count++] =
+                (PsxMetalEntry){(uint32_t)(top + y), spans[y].x, spans[y].width, index};
+    return 1;
+}
+
 static int metal_draw(const RTarget *t, const PsxMetalSpan *spans,
                       int top, int height, uint16_t color) {
+    if (g_metal_batch_depth && metal_enqueue(t, spans, top, height, color))
+        return 1;
     uint16_t *rows = t->buf + (size_t)top * t->w;
     unsigned char dirty[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
     const int track = t->buf == g_vram && g_psx_vram_dirty_tracking;
@@ -982,6 +1119,7 @@ static void raster_gouraud_triangle(const RTarget *t,
 void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
                               int x1, int y1, uint16_t c1,
                               int x2, int y2, uint16_t c2) {
+    METAL_BATCH_SYNC();
     RTarget n = rt_native();
     raster_gouraud_triangle(&n, x0, y0, c0, x1, y1, c1, x2, y2, c2);
     if (g_hr) {
@@ -1124,6 +1262,7 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
                                int x2, int y2, int u2, int v2,
                                uint16_t clut_x, uint16_t clut_y,
                                uint16_t texpage) {
+    METAL_BATCH_SYNC();
     int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
                   - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
     if (area2 == 0) { precise_consumed(); return; }
@@ -1312,6 +1451,7 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
                                       uint32_t color2,
                                       uint16_t clut_x, uint16_t clut_y,
                                       uint16_t texpage, int raw_texture) {
+    METAL_BATCH_SYNC();
     int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
                   - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
     if (area2 == 0) { precise_consumed(); return; }
@@ -1453,6 +1593,7 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
                            int u, int v,
                            uint16_t clut_x, uint16_t clut_y,
                            uint16_t texpage) {
+    METAL_BATCH_SYNC();
     if (g_texture_filter) sw_rect_uv_limits(u, v, u + w, v + h);
     RTarget n = rt_native();
     raster_textured_rect(&n, x, y, w, h, u, v, clut_x, clut_y, texpage);
@@ -1491,6 +1632,7 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
 void sw_wide_emit_tile(int band_y, int x, int y, int u, int v,
                        uint16_t clut_x, uint16_t clut_y, uint16_t texpage,
                        uint32_t color24, int semi_trans, int semi_mode, int raw_texture) {
+    METAL_BATCH_SYNC();
     if (!g_wide_cur) return;
     int s = g_scale, dx = wide_dx();
     RTarget t;
@@ -1545,6 +1687,7 @@ void sw_draw_textured_rect_scaled(int x, int y, int w, int h,
                                   int u0, int v0, int u1, int v1,
                                   uint16_t clut_x, uint16_t clut_y,
                                   uint16_t texpage) {
+    METAL_BATCH_SYNC();
     if (w <= 0 || h <= 0) return;
     if (g_texture_filter) sw_rect_uv_limits(u0, v0, u1, v1);
     RTarget n = rt_native();
@@ -1598,6 +1741,7 @@ static inline void wide_put_block_opaque(int nx, int ny, uint16_t color) {
 }
 
 void sw_draw_line(int x0, int y0, int x1, int y1, uint16_t color) {
+    METAL_BATCH_SYNC();
     RTarget n = rt_native();
     int dx = abs(x1 - x0);
     int dy = -abs(y1 - y0);
@@ -1620,6 +1764,7 @@ void sw_draw_line(int x0, int y0, int x1, int y1, uint16_t color) {
 
 void sw_draw_shaded_line(int x0, int y0, uint16_t c0,
                          int x1, int y1, uint16_t c1) {
+    METAL_BATCH_SYNC();
     RTarget n = rt_native();
     int dx = abs(x1 - x0);
     int dy = -abs(y1 - y0);
@@ -1659,6 +1804,7 @@ void sw_draw_shaded_line(int x0, int y0, uint16_t c0,
 /* ------------------------------------------------------------------ */
 
 void sw_vram_write(int x, int y, uint16_t pixel) {
+    METAL_BATCH_SYNC();
     x &= (VRAM_WIDTH - 1);
     y &= (VRAM_HEIGHT - 1);
     g_vram[y * VRAM_WIDTH + x] = pixel;
@@ -1675,6 +1821,7 @@ void sw_vram_write(int x, int y, uint16_t pixel) {
 }
 
 uint16_t sw_vram_read(int x, int y) {
+    METAL_BATCH_SYNC();
     return vram_get(x, y);
 }
 
@@ -1722,6 +1869,7 @@ static void hr_rebuild_from_vram(void) {
 }
 
 void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
+    METAL_BATCH_SYNC();
     if (!data || !g_vram || w <= 0 || h <= 0) return;
 
     /* Full-VRAM replace (savestate / boot_state): memcpy + one HR rebuild.
@@ -1770,6 +1918,7 @@ void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
 }
 
 void sw_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
+    METAL_BATCH_SYNC();
     if (!data || !g_vram || w <= 0 || h <= 0) return;
 
     if (x == 0 && y == 0 && w == VRAM_WIDTH && h == VRAM_HEIGHT) {
@@ -1815,6 +1964,7 @@ static inline uint32_t rgb555_to_argb(uint16_t pix) {
 
 int sw_render_display(uint32_t *out_pixels, int out_pitch,
                       int disp_x, int disp_y, int disp_w, int disp_h) {
+    METAL_BATCH_SYNC();
     int count = 0;
 
     for (int row = 0; row < disp_h; row++) {
@@ -1833,6 +1983,7 @@ int sw_render_display(uint32_t *out_pixels, int out_pitch,
 
 int sw_render_display_hires(uint32_t *out_pixels, int out_pitch,
                             int disp_x, int disp_y, int disp_w, int disp_h) {
+    METAL_BATCH_SYNC();
     if (!g_hr || g_scale <= 1)
         return sw_render_display(out_pixels, out_pitch, disp_x, disp_y,
                                  disp_w, disp_h);
@@ -1890,6 +2041,7 @@ static uint16_t *wide_surf_for(int base_x) {
 /* Enable native-wide with a wide width + centering offset (native px), or
  * disable (wide_w <= 0). Re-allocates if the width changed. */
 void sw_wide_set_view(int enabled, int shift, int pad_left, int pad_right) {
+    METAL_BATCH_SYNC();
     if (!enabled) shift = pad_left = pad_right = 0;
     if (view_enabled == enabled && view_shift == shift &&
         view_pad_left == pad_left && view_pad_right == pad_right) return;
@@ -1900,6 +2052,7 @@ void sw_wide_set_view(int enabled, int shift, int pad_left, int pad_right) {
 }
 
 void sw_wide_configure(int wide_w, int offset) {
+    METAL_BATCH_SYNC();
     if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; return; }
     if (wide_w != g_wide_w) wide_free_all();
     g_wide_w = wide_w;
@@ -1908,16 +2061,18 @@ void sw_wide_configure(int wide_w, int offset) {
 
 /* Select the wide surface to mirror into for the back buffer at base_x. */
 void sw_wide_set_target(int base_x) {
+    METAL_BATCH_SYNC();
     g_wide_cur = wide_surf_for(base_x);
     g_wide_cur_base = base_x;
 }
 
 /* Stop mirroring (offscreen draws that don't target a framebuffer). */
-void sw_wide_disable_target(void) { g_wide_cur = NULL; }
+void sw_wide_disable_target(void) { METAL_BATCH_SYNC(); g_wide_cur = NULL; }
 
 /* Mirror a framebuffer clear: fill the full wide width over [y, y+h) of the
  * surface for base_x, so the revealed margins are clean (not stale). */
 void sw_wide_clear(int base_x, int y, int h, uint16_t color) {
+    METAL_BATCH_SYNC();
     uint16_t *surf = wide_surf_for(base_x);
     if (!surf) return;
     int s = g_scale;
@@ -1935,6 +2090,7 @@ void sw_wide_clear(int base_x, int y, int h, uint16_t color) {
 /* Clear only the synthetic columns outside the centred canonical framebuffer.
  * This provides a defined black void without disturbing guest-owned pixels. */
 void sw_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) {
+    METAL_BATCH_SYNC();
     uint16_t *surf = wide_surf_for(base_x);
     if (!surf) return;
     int s = g_scale;
@@ -1966,6 +2122,7 @@ static uint16_t *wide_surf_existing(int base_x) {
  * centre at bit 15 once it blends, so the bands blend exactly like it. */
 void sw_wide_feedback_rect(int src_base, int src_x, int src_y, int dst_x, int dst_y,
                            int w, int h, int r, int g, int b, int raw, int semi) {
+    METAL_BATCH_SYNC();
     const uint16_t *src = wide_surf_existing(src_base);
     if (!src || !g_wide_cur || src == g_wide_cur || w <= 0 || h <= 0) return;
     RTarget t = rt_wide();
@@ -1998,6 +2155,7 @@ void sw_wide_feedback_rect(int src_base, int src_x, int src_y, int dst_x, int ds
  * surface exists for base_x (caller falls back to the canonical present). */
 int sw_render_wide_display(uint32_t *out_pixels, int out_pitch, int base_x,
                            int disp_y, int disp_h) {
+    METAL_BATCH_SYNC();
     uint16_t *surf = NULL;
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         if (g_wide_surf[i] && g_wide_base[i] == base_x) { surf = g_wide_surf[i]; break; }
@@ -2026,6 +2184,7 @@ int sw_wide_width(void) { return g_wide_w; }
  * the present selects. *ow/*oh receive the surface dims. Returns pixels written,
  * or 0 if no surface for base_x / it won't fit in cap_pixels. */
 int sw_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x) {
+    METAL_BATCH_SYNC();
     uint16_t *surf = NULL;
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         if (g_wide_surf[i] && g_wide_base[i] == base_x) { surf = g_wide_surf[i]; break; }
@@ -2037,4 +2196,96 @@ int sw_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_
     if (ow) *ow = W;
     if (oh) *oh = H;
     return W * H;
+}
+
+/* ------------------------------------------------------------------ */
+/* Renderer state snapshot (recordings and offline replay)            */
+/* ------------------------------------------------------------------ */
+
+/* Fixed-width fields so a snapshot means the same thing in every build. */
+typedef struct {
+    char magic[8];
+    int32_t scale, clip[4], offset[2];
+    int32_t semi_enabled, semi_mode, mask_set, mask_check;
+    uint8_t tw[4], mod[3], pad;
+    int32_t raw_texture, texture_filter, texture_filter_req, faithful;
+    int32_t precise_valid, precise_x16[3], precise_y16[3];
+    int32_t perspective_valid;
+    float perspective_q[3];
+    int32_t uv_lim[4];
+    int32_t view[4];
+} SwStateHeader;
+
+static const char k_sw_state_magic[8] = {'P','S','X','S','W','S','1','\0'};
+
+size_t sw_state_size(void) {
+    size_t pixels = (size_t)VRAM_WIDTH * VRAM_HEIGHT;
+    if (g_hr) pixels += (size_t)g_hr_w * g_hr_h;
+    return sizeof(SwStateHeader) + pixels * sizeof(uint16_t);
+}
+
+int sw_state_save(void *out, size_t capacity) {
+    METAL_BATCH_SYNC();
+    if (g_wide_w || capacity < sw_state_size()) return 0;
+    SwStateHeader h;
+    memset(&h, 0, sizeof h);
+    memcpy(h.magic, k_sw_state_magic, sizeof h.magic);
+    h.scale = g_scale;
+    h.clip[0] = g_clip_x1; h.clip[1] = g_clip_y1; h.clip[2] = g_clip_x2; h.clip[3] = g_clip_y2;
+    h.offset[0] = g_offset_x; h.offset[1] = g_offset_y;
+    h.semi_enabled = g_semi_trans_enabled; h.semi_mode = g_semi_trans_mode;
+    h.mask_set = g_mask_set_bit; h.mask_check = g_mask_check_bit;
+    h.tw[0] = g_tw_mask_x; h.tw[1] = g_tw_mask_y; h.tw[2] = g_tw_off_x; h.tw[3] = g_tw_off_y;
+    h.mod[0] = g_mod_r; h.mod[1] = g_mod_g; h.mod[2] = g_mod_b;
+    h.raw_texture = g_raw_texture;
+    h.texture_filter = g_texture_filter; h.texture_filter_req = g_texture_filter_req;
+    h.faithful = g_faithful_authority;
+    h.precise_valid = g_precise_valid;
+    memcpy(h.precise_x16, g_precise_x16, sizeof h.precise_x16);
+    memcpy(h.precise_y16, g_precise_y16, sizeof h.precise_y16);
+    h.perspective_valid = g_perspective_valid;
+    memcpy(h.perspective_q, g_perspective_q, sizeof h.perspective_q);
+    memcpy(h.uv_lim, g_uv_lim, sizeof h.uv_lim);
+    h.view[0] = view_enabled; h.view[1] = view_shift;
+    h.view[2] = view_pad_left; h.view[3] = view_pad_right;
+    uint8_t *p = (uint8_t *)out;
+    memcpy(p, &h, sizeof h);
+    p += sizeof h;
+    memcpy(p, g_vram, (size_t)VRAM_WIDTH * VRAM_HEIGHT * sizeof(uint16_t));
+    p += (size_t)VRAM_WIDTH * VRAM_HEIGHT * sizeof(uint16_t);
+    if (g_hr) memcpy(p, g_hr, (size_t)g_hr_w * g_hr_h * sizeof(uint16_t));
+    return 1;
+}
+
+/* Restores a snapshot into an initialized renderer, including its scale. */
+int sw_state_load(const void *in, size_t size) {
+    METAL_BATCH_SYNC();
+    SwStateHeader h;
+    if (size < sizeof h) return 0;
+    memcpy(&h, in, sizeof h);
+    if (memcmp(h.magic, k_sw_state_magic, sizeof h.magic) != 0) return 0;
+    sw_renderer_set_scale(h.scale);
+    if (g_scale != h.scale || size != sw_state_size()) return 0;
+    g_clip_x1 = h.clip[0]; g_clip_y1 = h.clip[1]; g_clip_x2 = h.clip[2]; g_clip_y2 = h.clip[3];
+    g_offset_x = h.offset[0]; g_offset_y = h.offset[1];
+    g_semi_trans_enabled = h.semi_enabled; g_semi_trans_mode = h.semi_mode;
+    g_mask_set_bit = h.mask_set; g_mask_check_bit = h.mask_check;
+    g_tw_mask_x = h.tw[0]; g_tw_mask_y = h.tw[1]; g_tw_off_x = h.tw[2]; g_tw_off_y = h.tw[3];
+    g_mod_r = h.mod[0]; g_mod_g = h.mod[1]; g_mod_b = h.mod[2];
+    g_raw_texture = h.raw_texture;
+    g_texture_filter = h.texture_filter; g_texture_filter_req = h.texture_filter_req;
+    g_faithful_authority = h.faithful;
+    g_precise_valid = h.precise_valid;
+    memcpy(g_precise_x16, h.precise_x16, sizeof h.precise_x16);
+    memcpy(g_precise_y16, h.precise_y16, sizeof h.precise_y16);
+    g_perspective_valid = h.perspective_valid;
+    memcpy(g_perspective_q, h.perspective_q, sizeof h.perspective_q);
+    memcpy(g_uv_lim, h.uv_lim, sizeof h.uv_lim);
+    view_enabled = h.view[0]; view_shift = h.view[1];
+    view_pad_left = h.view[2]; view_pad_right = h.view[3];
+    const uint8_t *p = (const uint8_t *)in + sizeof h;
+    memcpy(g_vram, p, (size_t)VRAM_WIDTH * VRAM_HEIGHT * sizeof(uint16_t));
+    p += (size_t)VRAM_WIDTH * VRAM_HEIGHT * sizeof(uint16_t);
+    if (g_hr) memcpy(g_hr, p, (size_t)g_hr_w * g_hr_h * sizeof(uint16_t));
+    return 1;
 }

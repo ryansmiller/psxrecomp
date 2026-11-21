@@ -96,6 +96,11 @@ void gr_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
                                       uint16_t clut_x, uint16_t clut_y,
                                       uint16_t texpage, int raw_texture);
 void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t color);
+/* Flat-primitive batching window for the software renderer's Metal
+ * rasterizer. Other backends ignore it. gr_batch_sync applies queued work. */
+void gr_batch_begin(void);
+void gr_batch_end(void);
+void gr_batch_sync(void);
 void gr_draw_textured_rect(int x, int y, int w, int h,
                            int u, int v,
                            uint16_t clut_x, uint16_t clut_y,

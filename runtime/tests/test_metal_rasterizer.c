@@ -25,7 +25,9 @@ static uint16_t vram[width * height], expected[width * height];
 static uint32_t display[view_width * view_height * 16];
 static uint32_t reference[view_width * view_height * 16];
 
-static void draw(int metal, int scale, int blend, int check, int set) {
+/* batch queues the flat primitives between begin and end. The copy reads
+ * pixels the earlier primitives wrote, so it must apply the queue first. */
+static void draw(int metal, int batch, int scale, int blend, int check, int set) {
     assert(setenv("PSX_METAL_RASTERIZER", metal ? "1" : "0", 1) == 0);
     sw_renderer_init(vram);
     sw_renderer_set_scale(1);
@@ -33,6 +35,7 @@ static void draw(int metal, int scale, int blend, int check, int set) {
     memset(dirty, 0, sizeof(dirty));
     sw_renderer_set_scale(scale);
     sw_set_draw_area(3, 2, view_width - 1, view_height - 1);
+    if (batch) sw_metal_batch_begin();
     sw_draw_flat_rect(4, 16, 259, 191, 0x2a11);
     sw_set_mask_bits(1, 0);
     sw_draw_flat_rect(3, 5, 31, 226, 0x4b21);
@@ -40,9 +43,15 @@ static void draw(int metal, int scale, int blend, int check, int set) {
     sw_set_semi_transparency(blend >= 0, blend);
     sw_draw_flat_triangle(346, 169, -40, 193, 154, -15, 0xed3a);
     sw_draw_flat_triangle(20, 4, 271, 4, 177, 280, 0x0725);
+    sw_copy_rect(12, 20, 150, 60, 90, 70);
     sw_draw_flat_rect(-10, 39, 213, 193, 0x617c);
     sw_draw_flat_rect(6, 129, 10, 65, 0x7d65);
     sw_draw_flat_rect(4, 5, 0, 6, 0xffff);
+    if (batch) {
+        /* Each frame pixel read must observe queued writes. */
+        assert(sw_vram_read(8, 140) == vram[140 * width + 8]);
+        sw_metal_batch_end();
+    }
 }
 
 int main(void) {
@@ -53,21 +62,23 @@ int main(void) {
                 unsigned char expected_dirty[height];
                 int pitch = view_width * scale * sizeof(uint32_t);
                 size_t size = (size_t)pitch * view_height * scale;
-                draw(0, scale, blend, mask & 1, mask & 2);
+                draw(0, 0, scale, blend, mask & 1, mask & 2);
                 memcpy(expected, vram, sizeof(vram));
                 memcpy(expected_dirty, dirty, sizeof(dirty));
                 sw_render_display_hires(reference, pitch, 0, 0, view_width, view_height);
 
-                uint64_t draw_start = psx_metal_completed_draws();
-                draw(1, scale, blend, mask & 1, mask & 2);
-                assert(psx_metal_completed_draws() - draw_start == (scale == 1 ? 6 : 12));
-                sw_render_display_hires(display, pitch, 0, 0, view_width, view_height);
-                assert(memcmp(vram, expected, sizeof(vram)) == 0);
-                assert(memcmp(display, reference, size) == 0);
-                assert(memcmp(dirty, expected_dirty, sizeof(dirty)) == 0);
+                for (int batch = 0; batch < 2; ++batch) {
+                    uint64_t draw_start = psx_metal_completed_draws();
+                    draw(1, batch, scale, blend, mask & 1, mask & 2);
+                    assert(psx_metal_completed_draws() - draw_start == (scale == 1 ? 6 : 12));
+                    sw_render_display_hires(display, pitch, 0, 0, view_width, view_height);
+                    assert(memcmp(vram, expected, sizeof(vram)) == 0);
+                    assert(memcmp(display, reference, size) == 0);
+                    assert(memcmp(dirty, expected_dirty, sizeof(dirty)) == 0);
+                }
             }
         }
-        printf("%dx: 20 exact VRAM, dirty-row and display comparisons (%llu GPU draws)\n",
+        printf("%dx: 20 cases, each exact for immediate and batched Metal VRAM, dirty rows and display (%llu GPU primitives)\n",
                scale, (unsigned long long)(psx_metal_completed_draws() - before));
     }
     return 0;

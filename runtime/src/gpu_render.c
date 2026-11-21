@@ -12,6 +12,8 @@
 
 #include "gpu_render.h"
 #include "gpu_sw_renderer.h"
+#include "gpu_render_record.h"
+#include "psx_metal_timing.h"
 #include "gpu_hd_textures.h"
 #include "gpu_uv.h"
 #include <stdio.h>
@@ -68,6 +70,10 @@ extern const GpuRenderBackend *vk_backend_get(void);
 
 static const GpuRenderBackend *g_b         = &SW_BACKEND;
 static GrBackend               g_effective = GR_BACKEND_SOFTWARE;
+/* Installed by gpu_render_record.c while a recording is open, so the facade
+ * has no link dependency on the recorder. */
+static void (*g_record_note)(int code);
+static int (*g_record_stop)(void);
 static int g_hd_offset_x, g_hd_offset_y;
 static uint32_t g_hd_texture_window;
 static int g_hd_semi, g_hd_perspective;
@@ -121,6 +127,8 @@ static void hd_invalidate_triangle(int x0, int y0, int x1, int y1, int x2, int y
 }
 
 void gr_set_backend(GrBackend backend) {
+    if (g_record_stop) g_record_stop();   /* a recording covers one backend */
+    sw_metal_batch_sync();
     if (backend == GR_BACKEND_OPENGL) {
         const GpuRenderBackend *gl = gl_backend_get();
         if (gl) {
@@ -231,6 +239,56 @@ void gr_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0, uint32_t c
                                        x2, y2, u2, v2, c2, clut_x, clut_y, texpage, raw);
     hd_invalidate_triangle(x0, y0, x1, y1, x2, y2);
     g_hd_perspective = 0;
+}
+/* Each window records whether it began batching, so a backend switch inside
+ * the window cannot unbalance the software renderer's depth. */
+static unsigned g_batch_depth, g_batch_software;
+void gr_record_hooks(void (*note)(int code), int (*stop)(void)) {
+    g_record_note = note;
+    g_record_stop = stop;
+}
+static void gr_record_note_batch(int code) { if (g_record_note) g_record_note(code); }
+const GpuRenderBackend *gr_backend_table(void) { return g_b; }
+void gr_backend_table_replace(const GpuRenderBackend *table) { g_b = table; }
+int gr_backend_is_software(void) { return g_effective == GR_BACKEND_SOFTWARE; }
+
+#ifdef __APPLE__
+/* Outermost window spans: GP0 list walking plus rendering on this thread. */
+static PsxMetalTimingStream g_list_timing;
+static uint64_t g_list_begin;
+#endif
+
+void gr_batch_begin(void) {
+    gr_record_note_batch(GRR_BATCH_BEGIN);
+#ifdef __APPLE__
+    if (!g_batch_depth)
+        g_list_begin = psx_metal_timing_begin(&g_list_timing, "gpu-list");
+#endif
+    if (g_batch_depth < 32 && g_effective == GR_BACKEND_SOFTWARE) {
+        g_batch_software |= 1u << g_batch_depth;
+        sw_metal_batch_begin();
+    }
+    ++g_batch_depth;
+}
+void gr_batch_end(void) {
+    if (!g_batch_depth) return;
+    gr_record_note_batch(GRR_BATCH_END);
+    --g_batch_depth;
+    if (g_batch_depth < 32 && (g_batch_software & (1u << g_batch_depth))) {
+        g_batch_software &= ~(1u << g_batch_depth);
+        sw_metal_batch_end();
+    }
+#ifdef __APPLE__
+    if (!g_batch_depth && g_list_begin) {
+        psx_metal_timing_record(&g_list_timing, g_list_begin, psx_metal_timing_now(),
+                                g_effective, 0);
+        g_list_begin = 0;
+    }
+#endif
+}
+void gr_batch_sync(void) {
+    gr_record_note_batch(GRR_BATCH_SYNC);
+    sw_metal_batch_sync();
 }
 void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) { g_b->draw_flat_rect(x, y, w, h, c); if (w > 0 && h > 0) hd_invalidate_draw(x,y,x+w-1,y+h-1); }
 void gr_draw_textured_rect(int x, int y, int w, int h, int u, int v,

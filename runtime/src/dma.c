@@ -13,6 +13,7 @@
  */
 
 #include "dma.h"
+#include "gpu_render.h" /* gr_batch_begin/end around GPU list walks */
 #include "cdrom.h"
 #include "crash_trace.h"
 #include "dirty_ram_interp.h"
@@ -824,6 +825,23 @@ static void gpu_ll_complete(void *opaque, int hit_limit) {
     complete_transfer(2);
 }
 
+static const DMAGPULinkedListOps gpu_ll_ops;
+
+/* One walker step is a flat-primitive batching window: devices and the CPU
+ * run only between steps, so VRAM is current whenever they can observe it. */
+static void gpu_ll_advance(uint32_t cycles) {
+    gr_batch_begin();
+    dma_gpu_ll_advance(&gpu_linked_list, cycles, &gpu_ll_ops, NULL);
+    gr_batch_end();
+}
+
+static int gpu_ll_host_draw_drain(void) {
+    gr_batch_begin();
+    const int drained = dma_host_draw_drain(&gpu_linked_list, s_host_draw, &gpu_ll_ops, NULL);
+    gr_batch_end();
+    return drained;
+}
+
 static const DMAGPULinkedListOps gpu_ll_ops = {
     gpu_ll_resolve_address,
     gpu_ll_read_word,
@@ -1051,11 +1069,13 @@ static int submit_native_gpu_linked_list(void) {
     gpu_ot_stats.starts++;
     gpu_ot_start_cycle = cyc0;
     gpu_ot_polls_this_walk = 0;
+    gr_batch_begin();
     for (uint32_t i = 0; i < node_count; ++i) {
         const NativeGpuNode *node = &s_native_nodes[i];
         gpu_submit_gp0_node(node->address, node->header >> 24,
                              s_native_words + node->offset);
     }
+    gr_batch_end();
     const NativeGpuNode *last = &s_native_nodes[node_count - 1u];
     gpu_linked_list.active = 0; /* A device catch-up must not walk it again. */
     gpu_linked_list.phase = DMA_GPU_LL_PHASE_IDLE;
@@ -1099,7 +1119,7 @@ static void hold_cpu_for_gpu_linked_list(void) {
            channel_enabled(2) && gpu_linked_list.nodes_processed < 0x80000u) {
         const uint32_t moved = gpu_linked_list.total_words;
         if((s_host_draw[0].bytes || s_host_draw[1].bytes) &&
-           dma_host_draw_drain(&gpu_linked_list,s_host_draw,&gpu_ll_ops,NULL)) {
+           gpu_ll_host_draw_drain()) {
             ++s_host_draw_nodes;s_host_draw_words+=gpu_linked_list.total_words-moved;
             continue;
         }
@@ -1338,8 +1358,7 @@ static void try_execute(int ch) {
                  * only with an unlimited budget; completion flags and the IRQ
                  * latch it raises are rolled back with the pass. */
                 while (g_psx_render_pass_active && gpu_linked_list.active)
-                    dma_gpu_ll_advance(&gpu_linked_list, UINT32_MAX,
-                                       &gpu_ll_ops, NULL);
+                    gpu_ll_advance(UINT32_MAX);
                 hold_cpu_for_gpu_linked_list();
             } else {
                 schedule_delayed_complete(2, execute_ch2_gpu(),
@@ -1512,7 +1531,7 @@ void dma_advance(uint32_t cycles) {
         g_dma_cur_madr = gpu_linked_list.current_addr;
         g_dma_cur_bcr = channels[2].bcr;
         g_dma_initiator_pc = s_dma_ch_initiator_pc[2];
-        dma_gpu_ll_advance(&gpu_linked_list, cycles, &gpu_ll_ops, NULL);
+        gpu_ll_advance(cycles);
     }
     DMAAsyncChannel *a = &cdrom_async;
     if (dma_cdrom_transfer_active()) {

@@ -2824,7 +2824,25 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
             src/gpu_sw_renderer.c)
         target_include_directories(metal_rasterizer_test PRIVATE include)
         psxrecomp_enable_metal_rasterizer(metal_rasterizer_test)
+        target_compile_options(metal_rasterizer_test PRIVATE
+            $<$<COMPILE_LANGUAGE:C>:-ffp-contract=off>)
         add_test(NAME metal_rasterizer_test COMMAND metal_rasterizer_test)
+
+        # Replays renderer recordings through the CPU and Metal rasterizers.
+        add_executable(gr_replay tests/replay_gr_recording.c src/gpu_sw_renderer.c)
+        target_include_directories(gr_replay PRIVATE include)
+        psxrecomp_enable_metal_rasterizer(gr_replay)
+        # Match the runtime's float semantics, or replays of recorded games
+        # round Gouraud and texture interpolation differently.
+        target_compile_options(gr_replay PRIVATE $<$<COMPILE_LANGUAGE:C>:-ffp-contract=off>)
+        find_package(Python3 COMPONENTS Interpreter)
+        if(Python3_FOUND)
+            add_test(NAME metal_replay_random_test
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/gen_gr_random.py
+                    --replay $<TARGET_FILE:gr_replay>
+                    --out ${CMAKE_CURRENT_BINARY_DIR}/gr_random)
+        endif()
     endif()
 
     # Bilinear neighbours clamp inside the base texel's 256-texel page.

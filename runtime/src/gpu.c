@@ -4651,6 +4651,7 @@ void gpu_vblank_tick(void) {
 }
 
 const uint16_t* gpu_get_vram(void) {
+    gr_batch_sync();
     return vram;
 }
 
@@ -7817,8 +7818,22 @@ uint64_t gpu_ws_census_seq(void) { return ws_census_seq; }
 /* Execute a fully-collected GP0 command */
 static void gp0_dispatch_command(uint8_t opcode);
 
+/* Packets that only queue flat primitives or set per-primitive state. Every
+ * other packet can read or write VRAM, so queued primitives apply first. */
+static int gp0_batch_safe(uint8_t opcode) {
+    switch (opcode & 0xFCu) {
+        case 0x20: case 0x28:             /* monochrome triangle and quad */
+        case 0x60: case 0x68: case 0x70: case 0x78: /* monochrome rectangles */
+            return 1;
+        default:
+            return opcode == 0x00 || (opcode >= 0xE1 && opcode <= 0xE6);
+    }
+}
+
 static void gp0_execute_command(void) {
     uint8_t opcode = (gp0_cmd_buf[0] >> 24) & 0xFF;
+    if (!gp0_batch_safe(opcode))
+        gr_batch_sync();
     gp0_opcode_count[opcode]++;
     gp0_ring_record(gp0_cmd_buf, gp0_words_needed);
     extern void ws_bg_phase_note(uint32_t op);
@@ -8904,5 +8919,5 @@ uint64_t gpu_pass_state_hash(void) {
     return h;
 }
 
-uint16_t* gpu_get_vram_ptr(void){ return vram; }
+uint16_t* gpu_get_vram_ptr(void){ gr_batch_sync(); return vram; }
 uint32_t  gpu_get_vram_bytes(void){ return (uint32_t)sizeof(vram); }
