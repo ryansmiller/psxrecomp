@@ -22,6 +22,7 @@
 #include "internal_resolution.h" /* the Internal Resolution mod and [video] internal_resolution */
 #include "mod_internal_resolution.h"
 #include "dynamic_resolution.h"  /* [video] dynamic_resolution: the step controller */
+#include "psx_metal_timing.h"
 #include "render_thread.h"        /* rt_get_stats: queue backpressure (dynres) */
 #include "psx_scheduler.h"   /* psx_scheduler_run — deterministic TCB scheduler */
 #include "parity_trace.h"    /* general two-process control-flow parity ring */
@@ -4631,9 +4632,21 @@ static void sdl_audio_pump(bool discard_output = false) {
          * SDL_QueueAudio. Lock guards the SPSC ring against the pull callback.
          * The T3 tap moves to sdl_drc_callback: what the device actually
          * receives is the bridge's device-rate output, not this buffer. */
+#ifdef __APPLE__
+        static PsxMetalTimingStream refill_timing;
+        const uint64_t refill_begin = psx_metal_timing_begin(&refill_timing, "audio-refill");
+#endif
         psx_sdl_audio_lock(sdl_audio_device);
         rab_push(&s_drc, sdl_audio_buf, frames);
+#ifdef __APPLE__
+        const uint64_t fill_us = refill_begin ? (uint64_t)(rab_fill_ms(&s_drc) * 1000.0) : 0;
+#endif
         psx_sdl_audio_unlock(sdl_audio_device);
+#ifdef __APPLE__
+        if (refill_begin)
+            psx_metal_timing_record(&refill_timing, refill_begin, psx_metal_timing_now(),
+                                    (uint64_t)frames, fill_us);
+#endif
     }
 }
 
@@ -10276,7 +10289,16 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             (turbo_loads_active && g_turbo_audio_sink_enabled);
         const int catchup_audio_sink = sdl_audio_catchup_sink(
             accelerated_audio_sink || fmv_skip_active);
+#ifdef __APPLE__
+        static PsxMetalTimingStream vblank_timing;
+        const uint64_t vblank_begin = psx_metal_timing_begin(&vblank_timing, "audio-vblank");
+#endif
         sdl_audio_update(fmv_skip_active, accelerated_audio_sink || catchup_audio_sink);
+#ifdef __APPLE__
+        if (vblank_begin)
+            psx_metal_timing_record(&vblank_timing, vblank_begin, psx_metal_timing_now(),
+                                    s_frame_count, (uint64_t)s_audio_gate);
+#endif
     }
 #endif
 

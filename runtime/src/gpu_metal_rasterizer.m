@@ -1,6 +1,7 @@
 #import <Metal/Metal.h>
 
 #include "gpu_metal_rasterizer.h"
+#include "psx_metal_timing.h"
 #include <string.h>
 
 typedef struct {
@@ -109,7 +110,12 @@ int psx_metal_draw_spans(uint16_t *rows, int pitch, const PsxMetalSpan *spans,
            threadsPerThreadgroup:MTLSizeMake(pipeline.threadExecutionWidth, 1, 1)];
         [encoder endEncoding];
         [command commit];
+        static PsxMetalTimingStream wait_timing;
+        uint64_t wait_begin = psx_metal_timing_begin(&wait_timing, "gpu-wait");
         [command waitUntilCompleted];
+        if (wait_begin)
+            psx_metal_timing_record(&wait_timing, wait_begin, psx_metal_timing_now(),
+                                    command.status, count);
         if (command.status != MTLCommandBufferStatusCompleted) return 0;
 
         for (int y = 0; y < height; ++y)
