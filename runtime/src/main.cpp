@@ -9853,6 +9853,28 @@ static void audio_buffer_diagnostics_tick() {
         (unsigned long long)audio_bridge_inits);
 }
 
+#ifdef __APPLE__
+/* Records one span on a timing stream when the scope ends. Only active when
+ * PSX_METAL_TIMING_DIR names a directory. */
+struct PsxMetalTimingScope {
+    PsxMetalTimingStream *stream;
+    uint64_t begin;
+    uint64_t tag = 0;
+    PsxMetalTimingScope(PsxMetalTimingStream *s, const char *name)
+        : stream(s), begin(psx_metal_timing_begin(s, name)) {}
+    ~PsxMetalTimingScope() {
+        psx_metal_timing_record(stream, begin, psx_metal_timing_now(), tag,
+                                s_frame_count);
+    }
+};
+#define PSX_METAL_TIMING_SCOPE(var, name) \
+    static PsxMetalTimingStream var##_stream; \
+    PsxMetalTimingScope var(&var##_stream, name)
+#else
+struct PsxMetalTimingScope { uint64_t tag = 0; };
+#define PSX_METAL_TIMING_SCOPE(var, name) PsxMetalTimingScope var
+#endif
+
 static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     NetplayVblankEpilogue ep{};
     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
@@ -10575,6 +10597,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     /* Canonical presentation/present span. It starts here and ends at function
      * exit, so skipped presents still contribute; pacer is measured above. */
     RuntimePerfSectionScope canonical_scope(&g_runtime_perf.canonical_ticks);
+    PSX_METAL_TIMING_SCOPE(canonical_timing, "present-canonical");
     probe_reached = 1;
     uint32_t w = 0, h = 0, present_h = 0;
     uint32_t present_w = 0;  /* display width actually presented (w + native-wide EXTRA) */
@@ -10849,6 +10872,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * when fmv_frame is false on a plain 4:3 window (ws layer not engaged). */
         pin_43 = fmv_frame || di.depth24 || (nw_pin && !wide_present);
         if (!wide_present) {
+            PSX_METAL_TIMING_SCOPE(scanout_timing, "present-scanout");
+            scanout_timing.tag = (uint64_t)active_scale;
             /* Never hires-present under netplay CPU-auth (even if settings say
              * 4× — that preference is offline-only). */
             if (active_scale > 1 && !netplay_cpu_auth_gpu()) {
@@ -10935,6 +10960,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     if (ensure_sdl_present_texture(std::max(1, src_w), std::max(1, src_h)) != 0)
         return ep;
     SDL_Rect src = { 0, 0, src_w, src_h };
+    /* Spans the SDL upload, composition and swap through function exit. */
+    PSX_METAL_TIMING_SCOPE(sdl_timing, "present-sdl");
+    sdl_timing.tag = (uint64_t)src_w * (uint64_t)src_h;
     SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
                       (int)(src_w * sizeof(uint32_t)));
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -11011,7 +11039,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     {
         latency_ring_mark(LAT_SWAP_BEGIN);
         const Uint64 t0 = SDL_GetPerformanceCounter();
-        software_present_with_telemetry(sdl_renderer);
+        {
+            PSX_METAL_TIMING_SCOPE(swap_timing, "present-swap");
+            software_present_with_telemetry(sdl_renderer);
+        }
         const Uint64 t1 = SDL_GetPerformanceCounter();
         latency_ring_mark(LAT_SWAP_END);
         netplay_note_present();
