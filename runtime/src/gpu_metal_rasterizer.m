@@ -1,4 +1,5 @@
 #import <Metal/Metal.h>
+#include <mach/vm_page_size.h>
 
 #include "gpu_metal_rasterizer.h"
 #include "psx_metal_timing.h"
@@ -191,6 +192,48 @@ typedef struct {
     uint32_t pixel, x, width, first, count;
 } PackedRow;
 
+/* Shared buffers that use renderer memory in place. Apple GPUs share memory
+ * with the CPU, so a page-aligned target needs no copies; the CPU only waits
+ * for the command buffer before touching it again. */
+enum { WRAPPED_TARGETS = 4 };
+static struct {
+    const void *memory;
+    size_t bytes;
+    id<MTLBuffer> buffer;
+} wrapped[WRAPPED_TARGETS];
+static unsigned wrapped_next;
+static uint64_t zero_copy_flushes, copied_flushes;
+
+void psx_metal_forget_memory(const void *memory) {
+    for (int i = 0; i < WRAPPED_TARGETS; ++i)
+        if (wrapped[i].memory == memory) {
+            wrapped[i].memory = NULL;
+            wrapped[i].bytes = 0;
+            wrapped[i].buffer = nil;
+        }
+}
+
+static id<MTLBuffer> wrap_target(void *memory, size_t bytes) {
+    if ((uintptr_t)memory % vm_page_size || bytes % vm_page_size) return nil;
+    for (int i = 0; i < WRAPPED_TARGETS; ++i)
+        if (wrapped[i].memory == memory && wrapped[i].bytes == bytes) return wrapped[i].buffer;
+    id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:memory
+                                                     length:bytes
+                                                    options:MTLResourceStorageModeShared
+                                                deallocator:nil];
+    if (!buffer) return nil;
+    const unsigned slot = wrapped_next++ % WRAPPED_TARGETS;
+    wrapped[slot].memory = memory;
+    wrapped[slot].bytes = bytes;
+    wrapped[slot].buffer = buffer;
+    return buffer;
+}
+
+void psx_metal_flush_counts(uint64_t *zero_copy, uint64_t *copied) {
+    *zero_copy = zero_copy_flushes;
+    *copied = copied_flushes;
+}
+
 typedef struct {
     uint32_t x, width, primitive;
 } PackedEntry;
@@ -240,6 +283,7 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
         free(cursor);
 
         /* Each touched row uploads only the extent its spans cover. */
+        id<MTLBuffer> target = wrap_target(buf, (size_t)rows * (size_t)pitch * sizeof(uint16_t));
         PackedRow *packed = batch_rows.contents;
         uint32_t *row_of = malloc((size_t)row_count * sizeof *row_of);
         if (!row_of) {
@@ -255,18 +299,19 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
                 if (sorted[i].x < left) left = sorted[i].x;
                 if (sorted[i].x + sorted[i].width > right) right = sorted[i].x + sorted[i].width;
             }
-            packed[r] = (PackedRow){pixel_count, left, right - left, first, count};
+            const uint32_t pixel = target ? (uint32_t)y * (uint32_t)pitch + left : pixel_count;
+            packed[r] = (PackedRow){pixel, left, right - left, first, count};
             row_of[r++] = (uint32_t)y;
             pixel_count += right - left;
             if (right - left > max_width) max_width = right - left;
         }
         free(row_counts);
-        if (!reserve(&batch_pixels, pixel_count * sizeof(uint16_t))) {
+        if (!target && !reserve(&batch_pixels, pixel_count * sizeof(uint16_t))) {
             free(row_of);
             return 0;
         }
-        uint16_t *data = batch_pixels.contents;
-        for (uint32_t i = 0; i < row_count; ++i)
+        uint16_t *data = target ? NULL : batch_pixels.contents;
+        for (uint32_t i = 0; data && i < row_count; ++i)
             memcpy(data + packed[i].pixel, buf + (size_t)row_of[i] * pitch + packed[i].x,
                    packed[i].width * sizeof(*data));
         memcpy(batch_primitives.contents, primitives,
@@ -280,7 +325,7 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
             return 0;
         }
         [encoder setComputePipelineState:batch_pipeline];
-        [encoder setBuffer:batch_pixels offset:0 atIndex:0];
+        [encoder setBuffer:(target ? target : batch_pixels) offset:0 atIndex:0];
         [encoder setBuffer:batch_rows offset:0 atIndex:1];
         [encoder setBuffer:batch_entries offset:0 atIndex:2];
         [encoder setBuffer:batch_primitives offset:0 atIndex:3];
@@ -302,12 +347,14 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
 
         const uint32_t *dirty = batch_dirty.contents;
         for (uint32_t i = 0; i < row_count; ++i) {
-            memcpy(buf + (size_t)row_of[i] * pitch + packed[i].x, data + packed[i].pixel,
-                   packed[i].width * sizeof(*data));
+            if (data)
+                memcpy(buf + (size_t)row_of[i] * pitch + packed[i].x, data + packed[i].pixel,
+                       packed[i].width * sizeof(*data));
             if (dirty_rows && dirty[i]) dirty_rows[row_of[i]] = 1;
         }
         free(row_of);
         completed_draws += primitive_count;
+        ++*(target ? &zero_copy_flushes : &copied_flushes);
         return 1;
     }
 }

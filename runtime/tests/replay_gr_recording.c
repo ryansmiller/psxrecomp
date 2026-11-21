@@ -37,7 +37,8 @@ void gpu_vram_dirty_mark_rect(int x, int y, int w, int h) {
 }
 void gpu_vram_dirty_mark_all(void) { memset(g_dirty, 1, sizeof g_dirty); }
 
-static uint16_t g_vram[VRAM_W * VRAM_H];
+/* Page-aligned like the runtime's VRAM, so Metal uses it in place. */
+static _Alignas(16384) uint16_t g_vram[VRAM_W * VRAM_H];
 /* --compare-only: generated recordings hold placeholder results, so only
  * the CPU and Metal passes are compared with each other. */
 static int g_compare_only;
@@ -395,8 +396,10 @@ int main(int argc, char **argv) {
             }
         }
         const uint64_t metal_primitives = psx_metal_completed_draws() - draws_before;
+        uint64_t zero_copy, copied;
+        psx_metal_flush_counts(&zero_copy, &copied);
 #else
-        const uint64_t metal_primitives = 0;
+        const uint64_t metal_primitives = 0, zero_copy = 0, copied = 0;
 #endif
         printf("%s: %s, %zu ops (", argv[f], ok ? "PASS" : "FAIL", cpu.ops);
         int first = 1;
@@ -405,7 +408,9 @@ int main(int argc, char **argv) {
                 printf("%s%s %llu", first ? "" : ", ", k_names[op], (unsigned long long)counts[op]);
                 first = 0;
             }
-        printf("), %llu Metal primitives\n", (unsigned long long)metal_primitives);
+        printf("), %llu Metal primitives; flushes so far: %llu in place, %llu copied\n",
+               (unsigned long long)metal_primitives, (unsigned long long)zero_copy,
+               (unsigned long long)copied);
         failures += !ok;
         free(cpu.hashes); free(gpu.hashes);
         free(cpu.final_state); free(gpu.final_state);

@@ -519,7 +519,13 @@ void sw_renderer_set_scale(int scale) {
     if (scale < 1) scale = 1;
     if (scale > SW_MAX_INTERNAL_SCALE) scale = SW_MAX_INTERNAL_SCALE;
 
-    if (g_hr) { free(g_hr); g_hr = NULL; }
+    if (g_hr) {
+#ifdef PSX_MACOS_METAL_RASTERIZER
+        psx_metal_forget_memory(g_hr);
+#endif
+        free(g_hr);
+        g_hr = NULL;
+    }
     /* Wide compositor surfaces are scale-sized; drop them so they re-allocate
      * at the new scale on next use (gpu re-configures native-wide after this). */
     wide_free_all();
@@ -528,7 +534,16 @@ void sw_renderer_set_scale(int scale) {
     if (scale > 1) {
         g_hr_w = VRAM_WIDTH * scale;
         g_hr_h = VRAM_HEIGHT * scale;
-        g_hr = (uint16_t *)calloc((size_t)g_hr_w * (size_t)g_hr_h, sizeof(uint16_t));
+        const size_t hr_bytes = (size_t)g_hr_w * (size_t)g_hr_h * sizeof(uint16_t);
+#ifdef __APPLE__
+        /* Page-aligned so Metal can use the mirror in place. Every scale
+         * makes hr_bytes a multiple of the 16 KiB page. */
+        void *hr = NULL;
+        g_hr = posix_memalign(&hr, 16384, hr_bytes) == 0 ? (uint16_t *)hr : NULL;
+        if (g_hr) memset(g_hr, 0, hr_bytes);
+#else
+        g_hr = (uint16_t *)calloc(1, hr_bytes);
+#endif
         if (!g_hr) {
             /* Allocation failed — fall back to native rendering. */
             g_scale = 1;

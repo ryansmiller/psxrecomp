@@ -78,8 +78,11 @@ int main(void) {
                 }
             }
         }
-        printf("%dx: 20 cases, each exact for immediate and batched Metal VRAM, dirty rows and display (%llu GPU primitives)\n",
-               scale, (unsigned long long)(psx_metal_completed_draws() - before));
+        uint64_t zero_copy, copied;
+        psx_metal_flush_counts(&zero_copy, &copied);
+        printf("%dx: 20 cases, each exact for immediate and batched Metal VRAM, dirty rows and display (%llu GPU primitives; batch flushes so far %llu in place, %llu copied)\n",
+               scale, (unsigned long long)(psx_metal_completed_draws() - before),
+               (unsigned long long)zero_copy, (unsigned long long)copied);
     }
     return 0;
 }

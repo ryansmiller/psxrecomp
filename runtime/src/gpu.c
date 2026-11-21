@@ -69,7 +69,13 @@ extern uint8_t  psx_read_byte(uint32_t addr);
 extern uint32_t psx_read_word(uint32_t addr);
 
 /* ---- VRAM ---- */
+#ifdef __APPLE__
+/* Page-aligned so Metal can use it in place as a shared buffer. */
+#include "psx_align.h"
+static PSX_ALIGN(16384) uint16_t vram[1024 * 512];
+#else
 static uint16_t vram[1024 * 512];
+#endif
 
 /* ---- GP0 state machine ---- */
 

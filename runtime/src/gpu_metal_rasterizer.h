@@ -35,6 +35,12 @@ typedef struct {
 /* Applies the batch to rows of buf. dirty_rows, when non-NULL, has one byte
  * per buffer row; rows written by a TRACK_DIRTY primitive are set to 1.
  * Returns 0 with buf and dirty_rows untouched when Metal is unavailable. */
+/* Drops any shared Metal buffer wrapping memory before it is freed. */
+void psx_metal_forget_memory(const void *memory);
+/* Batch flushes that used the target in place, and ones that copied rows
+ * because the target was not page-aligned. */
+void psx_metal_flush_counts(uint64_t *zero_copy, uint64_t *copied);
+
 int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
                          const PsxMetalPrimitive *primitives,
                          uint32_t primitive_count,
