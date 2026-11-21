@@ -52,14 +52,58 @@ static NSString *const shader =
 static NSString *const batch_shader =
     @"#include <metal_stdlib>\n"
     "using namespace metal;\n"
-    "struct Primitive { ushort color; uchar blend; uchar flags; };\n"
+    "struct Primitive {\n"
+    "    uint kind, color, blend, flags, texpage, clut, window;\n"
+    "    int x, y, u, v, w, h, du, dv;\n"
+    "};\n"
     "struct Entry { uint x, width, primitive; };\n"
-    "struct Row { uint pixel, x, width, first, count; };\n"
+    "struct Row { uint pixel, x, width, first, count, y; };\n"
+    /* gpu_sw_renderer.c vram_get and texel_fetch: VRAM wraps at 1024x512. */
+    "static uint vram_get(device const ushort *vram, int x, int y) {\n"
+    "    return vram[uint(y & 511) * 1024u + uint(x & 1023)];\n"
+    "}\n"
+    "static uint texel(device const ushort *vram, constant Primitive &p, int u, int v) {\n"
+    "    uint mx = p.window & 0xFFu, my = (p.window >> 8) & 0xFFu;\n"
+    "    if (mx | my) {\n"
+    "        uint ox = (p.window >> 16) & 0xFFu, oy = (p.window >> 24) & 0xFFu;\n"
+    "        u = (u & ~int(mx * 8u)) | int((ox & mx) * 8u);\n"
+    "        v = (v & ~int(my * 8u)) | int((oy & my) * 8u);\n"
+    "    }\n"
+    "    int tpx = int(p.texpage & 0xFu) * 64, tpy = int((p.texpage >> 4) & 1u) * 256;\n"
+    "    uint depth = (p.texpage >> 7) & 3u;\n"
+    "    int cx = int(p.clut & 0xFFFFu), cy = int(p.clut >> 16);\n"
+    "    if (depth == 0u) {\n"
+    "        uint word = vram_get(vram, tpx + u / 4, tpy + v);\n"
+    "        return vram_get(vram, cx + int((word >> uint((u & 3) * 4)) & 0xFu), cy);\n"
+    "    }\n"
+    "    if (depth == 1u) {\n"
+    "        uint word = vram_get(vram, tpx + u / 2, tpy + v);\n"
+    "        return vram_get(vram, cx + int((word >> uint((u & 1) * 8)) & 0xFFu), cy);\n"
+    "    }\n"
+    "    return vram_get(vram, tpx + u, tpy + v);\n"
+    "}\n"
+    "static uint blend(uint back, uint front, uint mode) {\n"
+    "    uint result = 0;\n"
+    "    for (uint shift = 0; shift < 15; shift += 5) {\n"
+    "        int b = (back >> shift) & 31u;\n"
+    "        int f = (front >> shift) & 31u;\n"
+    "        int c;\n"
+    "        switch (mode) {\n"
+    "            case 0: c = (b + f) >> 1; break;\n"
+    "            case 1: c = min(b + f, 31); break;\n"
+    "            case 2: c = max(b - f, 0); break;\n"
+    "            default: c = min(b + (f >> 2), 31); break;\n"
+    "        }\n"
+    "        result |= uint(c) << shift;\n"
+    "    }\n"
+    "    return result;\n"
+    "}\n"
     "kernel void raster_batch(device ushort *pixels [[buffer(0)]],\n"
     "                         constant Row *rows [[buffer(1)]],\n"
     "                         constant Entry *entries [[buffer(2)]],\n"
     "                         constant Primitive *primitives [[buffer(3)]],\n"
     "                         device atomic_uint *dirty [[buffer(4)]],\n"
+    "                         device const ushort *vram [[buffer(5)]],\n"
     "                         uint2 xy [[thread_position_in_grid]]) {\n"
     "    Row row = rows[xy.y];\n"
     "    if (xy.x >= row.width) return;\n"
@@ -70,24 +114,42 @@ static NSString *const batch_shader =
     "    for (uint i = row.first; i < row.first + row.count; ++i) {\n"
     "        Entry entry = entries[i];\n"
     "        if (x - entry.x >= entry.width) continue;\n"
-    "        Primitive p = primitives[entry.primitive];\n"
-    "        if ((p.flags & 1u) && (back & 0x8000u)) continue;\n"
-    "        uint result = p.color;\n"
-    "        if (p.blend < 4) {\n"
-    "            result = 0;\n"
-    "            for (uint shift = 0; shift < 15; shift += 5) {\n"
-    "                int b = (back >> shift) & 31u;\n"
-    "                int f = (uint(p.color) >> shift) & 31u;\n"
-    "                int c;\n"
-    "                switch (p.blend) {\n"
-    "                    case 0: c = (b + f) >> 1; break;\n"
-    "                    case 1: c = min(b + f, 31); break;\n"
-    "                    case 2: c = max(b - f, 0); break;\n"
-    "                    default: c = min(b + (f >> 2), 31); break;\n"
-    "                }\n"
-    "                result |= uint(c) << shift;\n"
+    "        constant Primitive &p = primitives[entry.primitive];\n"
+    "        uint result;\n"
+    "        bool semi;\n"
+    "        if (p.kind == 0u) {\n"
+    "            result = p.color;\n"
+    "            semi = true;\n"
+    "        } else {\n"
+    "            int col = int(x) - p.x, line = int(row.y) - p.y;\n"
+    "            int u, v;\n"
+    "            if (p.kind == 1u) {\n"
+    "                u = (p.u + col / p.w) & 0xFF;\n"
+    "                v = (p.v + line / p.w) & 0xFF;\n"
+    "            } else {\n"
+    "                u = (p.u + (p.du * col) / p.w) & 0xFF;\n"
+    "                v = (p.v + (p.dv * line) / p.h) & 0xFF;\n"
     "            }\n"
+    "            uint t = texel(vram, p, u, v);\n"
+    "            if (t == 0u) continue;\n"
+    /* put_textured: modulate unless raw; blend only translucent texels. */
+    "            if (p.color >> 24) {\n"
+    "                result = t & 0x7FFFu;\n"
+    "            } else {\n"
+    "                uint r = min(((t & 31u) * (p.color & 0xFFu)) >> 4, 31u);\n"
+    "                uint g = min((((t >> 5) & 31u) * ((p.color >> 8) & 0xFFu)) >> 4, 31u);\n"
+    "                uint b = min((((t >> 10) & 31u) * ((p.color >> 16) & 0xFFu)) >> 4, 31u);\n"
+    "                result = r | (g << 5) | (b << 10);\n"
+    "            }\n"
+    "            semi = (t & 0x8000u) != 0u;\n"
+    "            if ((p.flags & 1u) && (back & 0x8000u)) continue;\n"
+    "            if (p.blend < 4u && semi) result = blend(back, result, p.blend);\n"
+    "            back = result | (t & 0x8000u) | ((p.flags & 2u) ? 0x8000u : 0u);\n"
+    "            wrote = wrote || (p.flags & 4u);\n"
+    "            continue;\n"
     "        }\n"
+    "        if ((p.flags & 1u) && (back & 0x8000u)) continue;\n"
+    "        if (p.blend < 4u && semi) result = blend(back, result, p.blend);\n"
     "        back = result | ((p.flags & 2u) ? 0x8000u : 0u);\n"
     "        wrote = wrote || (p.flags & 4u);\n"
     "    }\n"
@@ -97,6 +159,7 @@ static NSString *const batch_shader =
 
 static id<MTLComputePipelineState> batch_pipeline;
 static id<MTLBuffer> batch_pixels, batch_rows, batch_entries, batch_primitives, batch_dirty;
+static id<MTLBuffer> batch_texture_vram;
 
 static int initialize(void) {
     static int attempted;
@@ -189,7 +252,7 @@ uint64_t psx_metal_completed_draws(void) {
 }
 
 typedef struct {
-    uint32_t pixel, x, width, first, count;
+    uint32_t pixel, x, width, first, count, y;
 } PackedRow;
 
 /* Shared buffers that use renderer memory in place. Apple GPUs share memory
@@ -239,6 +302,7 @@ typedef struct {
 } PackedEntry;
 
 int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
+                         const uint16_t *texture_vram,
                          const PsxMetalPrimitive *primitives,
                          uint32_t primitive_count,
                          const PsxMetalEntry *entries, uint32_t entry_count,
@@ -300,7 +364,7 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
                 if (sorted[i].x + sorted[i].width > right) right = sorted[i].x + sorted[i].width;
             }
             const uint32_t pixel = target ? (uint32_t)y * (uint32_t)pitch + left : pixel_count;
-            packed[r] = (PackedRow){pixel, left, right - left, first, count};
+            packed[r] = (PackedRow){pixel, left, right - left, first, count, (uint32_t)y};
             row_of[r++] = (uint32_t)y;
             pixel_count += right - left;
             if (right - left > max_width) max_width = right - left;
@@ -330,6 +394,18 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
         [encoder setBuffer:batch_entries offset:0 atIndex:2];
         [encoder setBuffer:batch_primitives offset:0 atIndex:3];
         [encoder setBuffer:batch_dirty offset:0 atIndex:4];
+        /* Native VRAM for texels and CLUTs, in place when page-aligned. */
+        enum { VRAM_BYTES = 1024 * 512 * 2 };
+        id<MTLBuffer> texels = texture_vram ? wrap_target((void *)texture_vram, VRAM_BYTES) : nil;
+        if (texture_vram && !texels) {
+            if (!reserve(&batch_texture_vram, VRAM_BYTES)) {
+                free(row_of);
+                return 0;
+            }
+            memcpy(batch_texture_vram.contents, texture_vram, VRAM_BYTES);
+            texels = batch_texture_vram;
+        }
+        [encoder setBuffer:(texels ? texels : batch_dirty) offset:0 atIndex:5];
         [encoder dispatchThreads:MTLSizeMake(max_width, row_count, 1)
            threadsPerThreadgroup:MTLSizeMake(batch_pipeline.threadExecutionWidth, 1, 1)];
         [encoder endEncoding];

@@ -80,6 +80,7 @@ static int g_hd_semi, g_hd_perspective;
 static void hd_observe_triangle(int x0,int y0,int u0,int v0,int x1,int y1,int u1,int v1,
     int x2,int y2,int u2,int v2,uint16_t cx,uint16_t cy,uint16_t tp) {
     if (g_effective == GR_BACKEND_OPENGL || !gpu_hd_textures_dump_enabled()) return;
+    sw_metal_batch_sync();   /* the dump reads native VRAM directly */
     if (g_effective == GR_BACKEND_VULKAN) g_b->vram_read(0,0);
     int limits[4], xs[3]={x0,x1,x2},ys[3]={y0,y1,y2},us[3]={u0,u1,u2},vs[3]={v0,v1,v2};
     if (g_hd_perspective) psx_uv_tri_world_limits(us,vs,limits);
@@ -88,6 +89,7 @@ static void hd_observe_triangle(int x0,int y0,int u0,int v0,int x1,int y1,int u1
 }
 static void hd_observe_rect(int u0,int v0,int u1,int v1,uint16_t cx,uint16_t cy,uint16_t tp) {
     if (g_effective == GR_BACKEND_OPENGL || !gpu_hd_textures_dump_enabled()) return;
+    sw_metal_batch_sync();   /* the dump reads native VRAM directly */
     if (g_effective == GR_BACKEND_VULKAN) g_b->vram_read(0,0);
     int limits[4]; psx_uv_rect_limits(u0,v0,u1,v1,limits);
     gpu_hd_textures_observe_draw(tp,cx,cy,limits,g_hd_texture_window,g_hd_semi);

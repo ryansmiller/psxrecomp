@@ -7824,12 +7824,15 @@ uint64_t gpu_ws_census_seq(void) { return ws_census_seq; }
 /* Execute a fully-collected GP0 command */
 static void gp0_dispatch_command(uint8_t opcode);
 
-/* Packets that only queue flat primitives or set per-primitive state. Every
- * other packet can read or write VRAM, so queued primitives apply first. */
+/* Packets that only queue renderer primitives or set per-primitive state.
+ * The software renderer applies its queue itself before any primitive it
+ * cannot batch; every other packet can read or write VRAM directly, so
+ * queued primitives apply first. */
 static int gp0_batch_safe(uint8_t opcode) {
     switch (opcode & 0xFCu) {
         case 0x20: case 0x28:             /* monochrome triangle and quad */
         case 0x60: case 0x68: case 0x70: case 0x78: /* monochrome rectangles */
+        case 0x64: case 0x6C: case 0x74: case 0x7C: /* textured rectangles */
             return 1;
         default:
             return opcode == 0x00 || (opcode >= 0xE1 && opcode <= 0xE6);

@@ -22,6 +22,9 @@ void sw_renderer_init(uint16_t* vram);
 void sw_metal_batch_begin(void);
 void sw_metal_batch_end(void);
 void sw_metal_batch_sync(void);
+/* Batch flushes forced by a VRAM read/write overlap, and primitives drawn on
+ * the CPU because they sample VRAM they write. */
+void sw_metal_batch_stats(uint64_t *hazard_flushes, uint64_t *self_hazards);
 
 /* Complete renderer state: draw settings, native VRAM and the high-resolution
  * mirror. Saving fails while the wide compositor is configured. Loading

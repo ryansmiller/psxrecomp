@@ -37,6 +37,9 @@
 #ifdef PSX_MACOS_METAL_RASTERIZER
 #include "gpu_metal_rasterizer.h"
 static int g_metal_rasterizer;
+/* PSX_METAL_BATCH_CPU=1 applies batches with the CPU executor instead of
+ * Metal, so tests can check the fallback against the reference. */
+static int g_metal_batch_cpu;
 /* Applies queued Metal primitives before VRAM is read or otherwise written. */
 #define METAL_BATCH_SYNC() sw_metal_batch_sync()
 #else
@@ -44,6 +47,9 @@ static int g_metal_rasterizer;
 void sw_metal_batch_begin(void) {}
 void sw_metal_batch_end(void) {}
 void sw_metal_batch_sync(void) {}
+void sw_metal_batch_stats(uint64_t *hazard_flushes, uint64_t *self_hazards) {
+    *hazard_flushes = *self_hazards = 0;
+}
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -484,6 +490,8 @@ void sw_renderer_init(uint16_t *vram) {
 #ifdef PSX_MACOS_METAL_RASTERIZER
     const char *metal = getenv("PSX_METAL_RASTERIZER");
     g_metal_rasterizer = metal && strcmp(metal, "1") == 0;
+    const char *cpu = getenv("PSX_METAL_BATCH_CPU");
+    g_metal_batch_cpu = cpu && strcmp(cpu, "1") == 0;
 #endif
     g_clip_x1 = 0;
     g_clip_y1 = 0;
@@ -800,7 +808,11 @@ static PsxMetalSpan metal_span(const RTarget *t, int left, int right) {
     return end > x ? (PsxMetalSpan){x, end - x} : (PsxMetalSpan){0, 0};
 }
 
-/* Queued flat primitives, one batch per target buffer. */
+static void raster_textured_rect(const RTarget *t, int x, int y, int w, int h,
+                                 int u, int v, uint16_t clut_x, uint16_t clut_y,
+                                 uint16_t texpage);
+
+/* Queued Metal primitives, one batch per target buffer. */
 #define METAL_BATCH_TARGETS 4
 #define METAL_BATCH_MAX_ENTRIES (1u << 20)
 typedef struct {
@@ -813,38 +825,137 @@ typedef struct {
 } MetalBatch;
 static MetalBatch g_metal_batches[METAL_BATCH_TARGETS];
 static int g_metal_batch_depth;
+static uint64_t g_metal_hazard_flushes, g_metal_self_hazards;
+
+/* Native VRAM tiles (16 wide, 4 tall) the open batches write, and that
+ * their textured primitives read. A batch never holds both for one tile:
+ * each target is a separate dispatch, so a read could otherwise see a later
+ * write. Each 1024-pixel row of tiles is one 64-bit word; four-row tiles
+ * keep one-row CLUTs apart from sprites drawn just above or below them. */
+#define METAL_TILE_W 16
+#define METAL_TILE_H 4
+typedef struct { uint64_t bits[VRAM_HEIGHT / METAL_TILE_H]; } MetalTiles;
+static MetalTiles g_metal_writes, g_metal_reads;
+
+static void tiles_add_span(MetalTiles *t, int x0, int x1, int y0, int y1) {
+    const int first = x0 / METAL_TILE_W, last = x1 / METAL_TILE_W;
+    const uint64_t mask = (last == 63 ? ~0ull : (1ull << (last + 1)) - 1) &
+                          ~((1ull << first) - 1);
+    for (int ty = y0 / METAL_TILE_H; ty <= y1 / METAL_TILE_H; ++ty) t->bits[ty] |= mask;
+}
+
+/* Adds native pixels [x, x+w) x [y, y+h), wrapping like vram_get. */
+static void tiles_add_rect(MetalTiles *t, int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (w > VRAM_WIDTH) w = VRAM_WIDTH;
+    if (h > VRAM_HEIGHT) h = VRAM_HEIGHT;
+    x &= VRAM_WIDTH - 1;
+    y &= VRAM_HEIGHT - 1;
+    const int xw = min_i(w, VRAM_WIDTH - x), yh = min_i(h, VRAM_HEIGHT - y);
+    tiles_add_span(t, x, x + xw - 1, y, y + yh - 1);
+    if (w > xw) tiles_add_span(t, 0, w - xw - 1, y, y + yh - 1);
+    if (h > yh) {
+        tiles_add_span(t, x, x + xw - 1, 0, h - yh - 1);
+        if (w > xw) tiles_add_span(t, 0, w - xw - 1, 0, h - yh - 1);
+    }
+}
+
+static int tiles_overlap(const MetalTiles *a, const MetalTiles *b) {
+    for (size_t i = 0; i < sizeof a->bits / sizeof a->bits[0]; ++i)
+        if (a->bits[i] & b->bits[i]) return 1;
+    return 0;
+}
+
+static void tiles_merge(MetalTiles *into, const MetalTiles *from) {
+    for (size_t i = 0; i < sizeof into->bits / sizeof into->bits[0]; ++i)
+        into->bits[i] |= from->bits[i];
+}
+
+/* Native VRAM a textured primitive may read: texels u0..u1, v0..v1
+ * (inclusive) of its texture page and its CLUT row. A texture window, or a
+ * range that wraps past 255, takes the whole page. */
+static void tiles_add_texture(MetalTiles *t, uint16_t texpage, uint16_t clut_x,
+                              uint16_t clut_y, int u0, int v0, int u1, int v1) {
+    const int depth = (texpage >> 7) & 3;
+    const int shift = depth == 0 ? 2 : depth == 1 ? 1 : 0;
+    const int page_x = (texpage & 0xF) * 64, page_y = ((texpage >> 4) & 1) * 256;
+    if (g_tw_mask_x | g_tw_mask_y || u0 < 0 || v0 < 0 || u1 > 255 || v1 > 255 ||
+        u1 < u0 || v1 < v0)
+        tiles_add_rect(t, page_x, page_y, 256 >> shift, 256);
+    else
+        tiles_add_rect(t, page_x + (u0 >> shift), page_y + v0,
+                       (u1 >> shift) - (u0 >> shift) + 1, v1 - v0 + 1);
+    if (depth < 2) tiles_add_rect(t, clut_x, clut_y, depth == 0 ? 16 : 256, 1);
+}
+
+/* gpu_sw_renderer's texel_fetch with the primitive's captured window. */
+static uint16_t metal_texel(const PsxMetalPrimitive *p, int u, int v) {
+    const int mx = p->window & 0xFF, my = (p->window >> 8) & 0xFF;
+    if (mx | my) {
+        const int ox = (p->window >> 16) & 0xFF, oy = (p->window >> 24) & 0xFF;
+        u = (u & ~(mx * 8)) | ((ox & mx) * 8);
+        v = (v & ~(my * 8)) | ((oy & my) * 8);
+    }
+    const int tpx = (p->texpage & 0xF) * 64, tpy = ((p->texpage >> 4) & 1) * 256;
+    const int depth = (p->texpage >> 7) & 3;
+    const int cx = (int)(p->clut & 0xFFFF), cy = (int)(p->clut >> 16);
+    if (depth == 0)
+        return vram_get(cx + ((vram_get(tpx + u / 4, tpy + v) >> ((u & 3) * 4)) & 0xF), cy);
+    if (depth == 1)
+        return vram_get(cx + ((vram_get(tpx + u / 2, tpy + v) >> ((u & 1) * 8)) & 0xFF), cy);
+    return vram_get(tpx + u, tpy + v);
+}
 
 /* Reference executor for a batch: the same per-pixel order as the kernel.
- * Used when Metal cannot run the batch. */
+ * Used when Metal cannot run the batch, or by PSX_METAL_BATCH_CPU=1. */
 static void metal_batch_apply_cpu(const MetalBatch *b, unsigned char *dirty) {
     for (uint32_t i = 0; i < b->entry_count; ++i) {
         const PsxMetalEntry e = b->entries[i];
-        const PsxMetalPrimitive p = b->primitives[e.primitive];
+        const PsxMetalPrimitive *p = &b->primitives[e.primitive];
         uint16_t *row = b->buf + (size_t)e.row * b->w;
         for (uint32_t x = e.x; x < e.x + e.width; ++x) {
-            uint16_t back = row[x];
-            if ((p.flags & PSX_METAL_CHECK_MASK) && (back & 0x8000)) continue;
-            uint16_t result = p.color;
-            if (p.blend < PSX_METAL_OPAQUE) {
-                result = 0;
-                for (int shift = 0; shift < 15; shift += 5) {
-                    int bc = (back >> shift) & 31, f = (p.color >> shift) & 31, c;
-                    switch (p.blend) {
-                        case 0: c = (bc + f) >> 1; break;
-                        case 1: c = min_i(bc + f, 31); break;
-                        case 2: c = max_i(bc - f, 0); break;
-                        default: c = min_i(bc + (f >> 2), 31); break;
-                    }
-                    result |= (uint16_t)(c << shift);
+            const uint16_t back = row[x];
+            uint16_t result, texel_bit = 0;
+            int semi = 1;
+            if (p->kind == PSX_METAL_FLAT) {
+                result = (uint16_t)p->color;
+            } else {
+                const int col = (int)x - p->x, line = (int)e.row - p->y;
+                int u, v;
+                if (p->kind == PSX_METAL_SPRITE) {
+                    u = (p->u + col / p->w) & 0xFF;
+                    v = (p->v + line / p->w) & 0xFF;
+                } else {
+                    u = (p->u + (p->du * col) / p->w) & 0xFF;
+                    v = (p->v + (p->dv * line) / p->h) & 0xFF;
                 }
+                const uint16_t texel = metal_texel(p, u, v);
+                if (texel == 0) continue;
+                if (p->color >> 24) {
+                    result = texel & 0x7FFF;
+                } else {
+                    const int r = min_i(((texel & 31) * (int)(p->color & 0xFF)) >> 4, 31);
+                    const int g = min_i((((texel >> 5) & 31) * (int)((p->color >> 8) & 0xFF)) >> 4, 31);
+                    const int bl = min_i((((texel >> 10) & 31) * (int)((p->color >> 16) & 0xFF)) >> 4, 31);
+                    result = (uint16_t)(r | (g << 5) | (bl << 10));
+                }
+                semi = (texel & 0x8000) != 0;
+                texel_bit = texel & 0x8000;
             }
-            row[x] = result | ((p.flags & PSX_METAL_SET_MASK) ? 0x8000 : 0);
-            if (p.flags & PSX_METAL_TRACK_DIRTY) dirty[e.row] = 1;
+            if ((p->flags & PSX_METAL_CHECK_MASK) && (back & 0x8000)) continue;
+            if (p->blend < PSX_METAL_OPAQUE && semi)
+                result = blend_pixels(back, result, (int)p->blend);
+            row[x] = result | texel_bit | ((p->flags & PSX_METAL_SET_MASK) ? 0x8000 : 0);
+            if (p->flags & PSX_METAL_TRACK_DIRTY) dirty[e.row] = 1;
         }
     }
 }
 
 void sw_metal_batch_sync(void) {
+    int textured = 0;
+    for (int i = 0; i < METAL_BATCH_TARGETS; ++i)
+        for (uint32_t k = 0; k < g_metal_batches[i].primitive_count && !textured; ++k)
+            textured = g_metal_batches[i].primitives[k].kind != PSX_METAL_FLAT;
     for (int i = 0; i < METAL_BATCH_TARGETS; ++i) {
         MetalBatch *b = &g_metal_batches[i];
         if (!b->entry_count) {
@@ -853,7 +964,9 @@ void sw_metal_batch_sync(void) {
         }
         unsigned char dirty[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
         memset(dirty, 0, (size_t)b->h);
-        if (!psx_metal_draw_batch(b->buf, b->w, b->h, b->primitives, b->primitive_count,
+        if (g_metal_batch_cpu ||
+            !psx_metal_draw_batch(b->buf, b->w, b->h, textured ? g_vram : NULL,
+                                  b->primitives, b->primitive_count,
                                   b->entries, b->entry_count, dirty))
             metal_batch_apply_cpu(b, dirty);
         if (b->buf == g_vram)
@@ -861,6 +974,8 @@ void sw_metal_batch_sync(void) {
                 if (dirty[y]) gpu_vram_dirty_mark_row((uint32_t)y);
         b->primitive_count = b->entry_count = 0;
     }
+    memset(&g_metal_writes, 0, sizeof g_metal_writes);
+    memset(&g_metal_reads, 0, sizeof g_metal_reads);
 }
 
 void sw_metal_batch_begin(void) {
@@ -870,6 +985,11 @@ void sw_metal_batch_begin(void) {
 void sw_metal_batch_end(void) {
     if (g_metal_batch_depth > 0 && --g_metal_batch_depth == 0)
         sw_metal_batch_sync();
+}
+
+void sw_metal_batch_stats(uint64_t *hazard_flushes, uint64_t *self_hazards) {
+    *hazard_flushes = g_metal_hazard_flushes;
+    *self_hazards = g_metal_self_hazards;
 }
 
 static int metal_grow(void **items, uint32_t *capacity, uint32_t needed, size_t size) {
@@ -883,26 +1003,64 @@ static int metal_grow(void **items, uint32_t *capacity, uint32_t needed, size_t 
     return 1;
 }
 
-/* Returns 0 when the primitive must draw immediately instead. */
-static int metal_enqueue(const RTarget *t, const PsxMetalSpan *spans,
-                         int top, int height, uint16_t color) {
+/* Fills the state fields every queued primitive shares. */
+static PsxMetalPrimitive metal_primitive(const RTarget *t, uint32_t kind, uint32_t color) {
+    PsxMetalPrimitive p;
+    memset(&p, 0, sizeof p);
+    p.kind = kind;
+    p.color = color;
+    p.blend = g_semi_trans_enabled ? (uint32_t)g_semi_trans_mode : PSX_METAL_OPAQUE;
+    p.flags = (g_mask_check_bit ? PSX_METAL_CHECK_MASK : 0) |
+              (g_mask_set_bit ? PSX_METAL_SET_MASK : 0) |
+              (t->buf == g_vram && g_psx_vram_dirty_tracking ? PSX_METAL_TRACK_DIRTY : 0);
+    return p;
+}
+
+/* Queues one primitive's spans on t. reads, when non-NULL, is the native
+ * VRAM it samples. Returns 0 when it must draw on the CPU instead; any open
+ * batch has then been applied. */
+static int metal_enqueue(const RTarget *t, const PsxMetalSpan *spans, int top, int height,
+                         const PsxMetalPrimitive *primitive, const MetalTiles *reads) {
+    MetalTiles writes;
+    memset(&writes, 0, sizeof writes);
+    if (t->buf == g_vram) {
+        int left = VRAM_WIDTH, right = 0, first = -1, last = -1;
+        for (int y = 0; y < height; ++y)
+            if (spans[y].width) {
+                if (first < 0) first = y;
+                last = y;
+                left = min_i(left, (int)spans[y].x);
+                right = max_i(right, (int)(spans[y].x + spans[y].width));
+            }
+        if (first < 0) return 1;   /* clipped away */
+        tiles_add_rect(&writes, left, top + first, right - left, last - first + 1);
+    }
+    if (reads && tiles_overlap(reads, &writes)) {
+        /* Its own writes feed its texels: only sequential drawing is exact. */
+        ++g_metal_self_hazards;
+        sw_metal_batch_sync();
+        return 0;
+    }
+    if ((reads && tiles_overlap(reads, &g_metal_writes)) ||
+        tiles_overlap(&writes, &g_metal_reads)) {
+        ++g_metal_hazard_flushes;
+        sw_metal_batch_sync();
+    }
+
     MetalBatch *b = NULL;
     for (int i = 0; i < METAL_BATCH_TARGETS && !b; ++i)
         if (g_metal_batches[i].buf == t->buf && g_metal_batches[i].w == t->w &&
             g_metal_batches[i].h == t->h)
             b = &g_metal_batches[i];
     for (int i = 0; i < METAL_BATCH_TARGETS && !b; ++i)
-        if (!g_metal_batches[i].entry_count) {
+        if (!g_metal_batches[i].entry_count && !g_metal_batches[i].primitive_count) {
             b = &g_metal_batches[i];
             b->buf = t->buf;
             b->w = t->w;
             b->h = t->h;
         }
-    if (!b || b->entry_count + (uint32_t)height > METAL_BATCH_MAX_ENTRIES) {
-        sw_metal_batch_sync();
-        return 0;
-    }
-    if (!metal_grow((void **)&b->primitives, &b->primitive_capacity,
+    if (!b || b->entry_count + (uint32_t)height > METAL_BATCH_MAX_ENTRIES ||
+        !metal_grow((void **)&b->primitives, &b->primitive_capacity,
                     b->primitive_count + 1u, sizeof *b->primitives) ||
         !metal_grow((void **)&b->entries, &b->entry_capacity,
                     b->entry_count + (uint32_t)height, sizeof *b->entries)) {
@@ -910,22 +1068,91 @@ static int metal_enqueue(const RTarget *t, const PsxMetalSpan *spans,
         return 0;
     }
     const uint32_t index = b->primitive_count++;
-    b->primitives[index] = (PsxMetalPrimitive){
-        color, (uint8_t)(g_semi_trans_enabled ? g_semi_trans_mode : PSX_METAL_OPAQUE),
-        (uint8_t)((g_mask_check_bit ? PSX_METAL_CHECK_MASK : 0) |
-                  (g_mask_set_bit ? PSX_METAL_SET_MASK : 0) |
-                  (t->buf == g_vram && g_psx_vram_dirty_tracking ? PSX_METAL_TRACK_DIRTY : 0))};
+    b->primitives[index] = *primitive;
     for (int y = 0; y < height; ++y)
         if (spans[y].width)
             b->entries[b->entry_count++] =
                 (PsxMetalEntry){(uint32_t)(top + y), spans[y].x, spans[y].width, index};
+    tiles_merge(&g_metal_writes, &writes);
+    if (reads) tiles_merge(&g_metal_reads, reads);
+    return 1;
+}
+
+/* Queues a textured rectangle on t. Returns 0 when it must draw on the CPU. */
+static int metal_sprite(const RTarget *t, const PsxMetalPrimitive *p, int x, int y,
+                        int w, int h, const MetalTiles *reads) {
+    if (w <= 0 || h <= 0) return 1;
+    const int top = max_i(0, max_i(y, t->cy1));
+    const int bottom = min_i(t->h, min_i(y + h, t->cy2 + 1));
+    if (bottom <= top) return 1;
+    const PsxMetalSpan span = metal_span(t, x, x + w);
+    if (!span.width) return 1;
+    PsxMetalSpan spans[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
+    for (int row = 0; row < bottom - top; ++row) spans[row] = span;
+    PsxMetalPrimitive placed = *p;
+    placed.x = x;
+    placed.y = y;
+    return metal_enqueue(t, spans, top, bottom - top, &placed, reads);
+}
+
+/* Batches a textured rectangle on every target, or returns 0 after applying
+ * any open batch so the caller draws it on the CPU. Bilinear filtering and
+ * the wide compositor stay on the CPU. */
+static int metal_textured_rect(int scaled, int x, int y, int w, int h, int u0, int v0,
+                               int u1, int v1, uint16_t clut_x, uint16_t clut_y,
+                               uint16_t texpage) {
+    if (!g_metal_batch_depth || g_texture_filter || g_wide_cur) return 0;
+    if (w <= 0 || h <= 0) return 1;
+    MetalTiles reads;
+    memset(&reads, 0, sizeof reads);
+    if (scaled)   /* u0 + du * col / w stays between u0 and u1 */
+        tiles_add_texture(&reads, texpage, clut_x, clut_y, min_i(u0, u1), min_i(v0, v1),
+                          max_i(u0, u1), max_i(v0, v1));
+    else
+        tiles_add_texture(&reads, texpage, clut_x, clut_y, u0, v0, u0 + w - 1, v0 + h - 1);
+    RTarget n = rt_native();
+    PsxMetalPrimitive p = metal_primitive(&n, scaled ? PSX_METAL_SCALED_SPRITE : PSX_METAL_SPRITE,
+        (uint32_t)g_mod_r | (uint32_t)g_mod_g << 8 | (uint32_t)g_mod_b << 16 |
+        (uint32_t)(g_raw_texture ? 1 : 0) << 24);
+    p.texpage = texpage;
+    p.clut = (uint32_t)clut_x | (uint32_t)clut_y << 16;
+    p.window = (uint32_t)g_tw_mask_x | (uint32_t)g_tw_mask_y << 8 |
+               (uint32_t)g_tw_off_x << 16 | (uint32_t)g_tw_off_y << 24;
+    p.u = u0;
+    p.v = v0;
+    p.w = scaled ? w : 1;
+    p.h = h;
+    p.du = u1 - u0;
+    p.dv = v1 - v0;
+    if (!metal_sprite(&n, &p, x, y, w, h, &reads)) return 0;
+    if (g_hr) {
+        const int s = g_scale;
+        RTarget hr = rt_hires();
+        PsxMetalPrimitive q = metal_primitive(&hr, p.kind, p.color);
+        q.texpage = p.texpage; q.clut = p.clut; q.window = p.window;
+        q.u = p.u; q.v = p.v; q.du = p.du; q.dv = p.dv;
+        q.w = scaled ? w * s : s;
+        q.h = h * s;
+        /* The native half is queued; if the mirror cannot be, the native
+         * copy is applied and the mirror draws on the CPU, the same order. */
+        if (!metal_sprite(&hr, &q, x * s, y * s, w * s, h * s, &reads)) {
+            if (scaled)
+                raster_textured_rect_scaled(&hr, x * s, y * s, w * s, h * s, u0, v0, u1, v1,
+                                            clut_x, clut_y, texpage);
+            else
+                raster_textured_rect(&hr, x * s, y * s, w * s, h * s, u0, v0,
+                                     clut_x, clut_y, texpage);
+        }
+    }
     return 1;
 }
 
 static int metal_draw(const RTarget *t, const PsxMetalSpan *spans,
                       int top, int height, uint16_t color) {
-    if (g_metal_batch_depth && metal_enqueue(t, spans, top, height, color))
-        return 1;
+    if (g_metal_batch_depth) {
+        const PsxMetalPrimitive p = metal_primitive(t, PSX_METAL_FLAT, color);
+        if (metal_enqueue(t, spans, top, height, &p, NULL)) return 1;
+    }
     uint16_t *rows = t->buf + (size_t)top * t->w;
     unsigned char dirty[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
     const int track = t->buf == g_vram && g_psx_vram_dirty_tracking;
@@ -1608,6 +1835,9 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
                            int u, int v,
                            uint16_t clut_x, uint16_t clut_y,
                            uint16_t texpage) {
+#ifdef PSX_MACOS_METAL_RASTERIZER
+    if (metal_textured_rect(0, x, y, w, h, u, v, 0, 0, clut_x, clut_y, texpage)) return;
+#endif
     METAL_BATCH_SYNC();
     if (g_texture_filter) sw_rect_uv_limits(u, v, u + w, v + h);
     RTarget n = rt_native();
@@ -1702,6 +1932,9 @@ void sw_draw_textured_rect_scaled(int x, int y, int w, int h,
                                   int u0, int v0, int u1, int v1,
                                   uint16_t clut_x, uint16_t clut_y,
                                   uint16_t texpage) {
+#ifdef PSX_MACOS_METAL_RASTERIZER
+    if (metal_textured_rect(1, x, y, w, h, u0, v0, u1, v1, clut_x, clut_y, texpage)) return;
+#endif
     METAL_BATCH_SYNC();
     if (w <= 0 || h <= 0) return;
     if (g_texture_filter) sw_rect_uv_limits(u0, v0, u1, v1);

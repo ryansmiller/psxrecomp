@@ -408,9 +408,13 @@ int main(int argc, char **argv) {
                 printf("%s%s %llu", first ? "" : ", ", k_names[op], (unsigned long long)counts[op]);
                 first = 0;
             }
-        printf("), %llu Metal primitives; flushes so far: %llu in place, %llu copied\n",
+        uint64_t hazards = 0, self_hazards = 0;
+        sw_metal_batch_stats(&hazards, &self_hazards);
+        printf("), %llu Metal primitives; so far %llu flushes in place, %llu copied, "
+               "%llu hazard flushes, %llu self-overlapping on CPU\n",
                (unsigned long long)metal_primitives, (unsigned long long)zero_copy,
-               (unsigned long long)copied);
+               (unsigned long long)copied, (unsigned long long)hazards,
+               (unsigned long long)self_hazards);
         failures += !ok;
         free(cpu.hashes); free(gpu.hashes);
         free(cpu.final_state); free(gpu.final_state);
