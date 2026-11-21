@@ -8,6 +8,23 @@ if(NOT DEFINED PSXRECOMP_ROOT)
     get_filename_component(PSXRECOMP_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
 
+option(PSX_MACOS_METAL_RASTERIZER "Build the experimental Metal flat-primitive rasterizer" OFF)
+if(PSX_MACOS_METAL_RASTERIZER AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    enable_language(OBJC)
+endif()
+
+function(psxrecomp_enable_metal_rasterizer target)
+    if(PSX_MACOS_METAL_RASTERIZER AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        find_library(_psx_metal_framework Metal REQUIRED)
+        find_library(_psx_foundation_framework Foundation REQUIRED)
+        target_sources(${target} PRIVATE "${PSXRECOMP_ROOT}/runtime/src/gpu_metal_rasterizer.m")
+        target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>")
+        set_property(TARGET ${target} PROPERTY OBJC_STANDARD 11)
+        target_compile_definitions(${target} PRIVATE PSX_MACOS_METAL_RASTERIZER=1)
+        target_link_libraries(${target} PRIVATE "${_psx_metal_framework}" "${_psx_foundation_framework}")
+    endif()
+endfunction()
+
 # The rebuild CLI configures this as `generate` for its instrumented pass and
 # `use` after it has merged the collected profile.  Keep the switch here,
 # beside the target it must affect: an otherwise unconsumed cache entry makes a
@@ -2555,6 +2572,8 @@ function(psxrecomp_add_runtime_target target)
             endif()
         endif()
     endif()
+
+    psxrecomp_enable_metal_rasterizer(${target})
 
     # ---- Vulkan backend (gpu_vk_renderer.c) --------------------------------
     # Vulkan is loaded ENTIRELY dynamically via SDL_Vulkan_LoadLibrary +

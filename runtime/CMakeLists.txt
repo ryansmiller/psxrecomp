@@ -2819,6 +2819,14 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
     endif()
     add_test(NAME sw_faithful_authority_test COMMAND sw_faithful_authority_test)
 
+    if(PSX_MACOS_METAL_RASTERIZER AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        add_executable(metal_rasterizer_test tests/test_metal_rasterizer.c
+            src/gpu_sw_renderer.c)
+        target_include_directories(metal_rasterizer_test PRIVATE include)
+        psxrecomp_enable_metal_rasterizer(metal_rasterizer_test)
+        add_test(NAME metal_rasterizer_test COMMAND metal_rasterizer_test)
+    endif()
+
     # Bilinear neighbours clamp inside the base texel's 256-texel page.
     add_executable(sw_bilinear_page_edge_test tests/test_sw_bilinear_page_edge.c)
     target_include_directories(sw_bilinear_page_edge_test PRIVATE include src)

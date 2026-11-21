@@ -34,6 +34,11 @@
 #include <stdlib.h>
 #include <math.h>
 
+#ifdef PSX_MACOS_METAL_RASTERIZER
+#include "gpu_metal_rasterizer.h"
+static int g_metal_rasterizer;
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Constants                                                          */
 /* ------------------------------------------------------------------ */
@@ -468,6 +473,10 @@ static void sw_rect_uv_limits(int u0, int v0, int u1, int v1) {
 
 void sw_renderer_init(uint16_t *vram) {
     g_vram = vram;
+#ifdef PSX_MACOS_METAL_RASTERIZER
+    const char *metal = getenv("PSX_METAL_RASTERIZER");
+    g_metal_rasterizer = metal && strcmp(metal, "1") == 0;
+#endif
     g_clip_x1 = 0;
     g_clip_y1 = 0;
     g_clip_x2 = VRAM_WIDTH - 1;
@@ -755,6 +764,69 @@ void sw_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
 /* Flat-shaded triangle (scanline rasterization)                      */
 /* ------------------------------------------------------------------ */
 
+#ifdef PSX_MACOS_METAL_RASTERIZER
+/* Preserve the reference renderer's clipping and dirty-row semantics. */
+static PsxMetalSpan metal_span(const RTarget *t, int left, int right) {
+    int x = max_i(0, max_i(left, t->cx1));
+    int end = min_i(t->w, min_i(right, t->cx2 + 1));
+    return end > x ? (PsxMetalSpan){x, end - x} : (PsxMetalSpan){0, 0};
+}
+
+static int metal_draw(const RTarget *t, const PsxMetalSpan *spans,
+                      int top, int height, uint16_t color) {
+    uint16_t *rows = t->buf + (size_t)top * t->w;
+    unsigned char dirty[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
+    const int track = t->buf == g_vram && g_psx_vram_dirty_tracking;
+    if (track) {
+        for (int y = 0; y < height; ++y) {
+            const uint16_t *row = rows + (size_t)y * t->w + spans[y].x;
+            dirty[y] = 0;
+            for (uint32_t x = 0; x < spans[y].width; ++x) {
+                if (!g_mask_check_bit || !(row[x] & 0x8000)) {
+                    dirty[y] = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    int blend = g_semi_trans_enabled ? g_semi_trans_mode : -1;
+    if (!psx_metal_draw_spans(rows, t->w, spans, height, color, blend,
+                             g_mask_check_bit, g_mask_set_bit))
+        return 0;
+    if (track)
+        for (int y = 0; y < height; ++y)
+            if (dirty[y]) gpu_vram_dirty_mark_row((uint32_t)(top + y));
+    return 1;
+}
+
+static int metal_triangle(const RTarget *t, int x0, int y0, int x1, int y1,
+                          int x2, int y2, uint16_t color) {
+    int top = max_i(0, max_i(y0, t->cy1));
+    int bottom = min_i(t->h, min_i(y2, t->cy2 + 1));
+    if (bottom <= top) return 1;
+    PsxMetalSpan spans[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
+    for (int y = top; y < bottom; ++y) {
+        int a, b;
+        psx_triangle_edges_at_y(x0, y0, x1, y1, x2, y2, y, &a, &b);
+        spans[y - top] = metal_span(t, min_i(a, b), max_i(a, b));
+    }
+    return metal_draw(t, spans, top, bottom - top, color);
+}
+
+static int metal_rect(const RTarget *t, int x, int y, int w, int h, uint16_t color) {
+    int top = max_i(0, max_i(y, t->cy1));
+    int bottom = min_i(t->h, min_i(y + h, t->cy2 + 1));
+    if (bottom <= top) return 1;
+    PsxMetalSpan span = metal_span(t, x, x + w);
+    if (!span.width) return 1;
+    PsxMetalSpan spans[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
+    for (int row = 0; row < bottom - top; ++row)
+        spans[row] = span;
+    return metal_draw(t, spans, top, bottom - top, color);
+}
+#endif
+
 static void raster_flat_triangle(const RTarget *t,
                                  int x0, int y0, int x1, int y1,
                                  int x2, int y2, uint16_t color) {
@@ -765,6 +837,10 @@ static void raster_flat_triangle(const RTarget *t,
 
     int dy_total = y2 - y0;
     if (dy_total == 0) return;
+#ifdef PSX_MACOS_METAL_RASTERIZER
+    if (g_metal_rasterizer && metal_triangle(t, x0, y0, x1, y1, x2, y2, color))
+        return;
+#endif
 
     for (int y = y0; y < y2; y++) {
         if (y < t->cy1 || y > t->cy2) continue;
@@ -1288,6 +1364,9 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
 
 static void raster_flat_rect(const RTarget *t, int x, int y, int w, int h,
                              uint16_t color) {
+#ifdef PSX_MACOS_METAL_RASTERIZER
+    if (g_metal_rasterizer && metal_rect(t, x, y, w, h, color)) return;
+#endif
     for (int row = 0; row < h; row++) {
         int py = y + row;
         if (py < t->cy1 || py > t->cy2) continue;
