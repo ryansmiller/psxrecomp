@@ -152,6 +152,102 @@ static NSString *const k_source =
     "    r = (r << 3) | (r >> 2); gg = (gg << 3) | (gg >> 2); b = (b << 3) | (b >> 2);\n"
     "    out.write(float4(float(r), float(gg), float(b), 255.0) / 255.0, g);\n"
     "}\n"
+    /* Window-size present, as gpu_gl_renderer.c presents a supersampled
+     * image: above 1.25 source texels per output pixel each output pixel
+     * averages its whole footprint (area resolve) with bilinear taps
+     * clamped to the display rect; below it, one bilinear tap. The c << 3
+     * basis is widened to 8 bits as the display decode does. flags 1: clear
+     * the row under the image. */
+    "struct Present { float2 origin, size; uint2 out; uint flags, pad; };\n"
+    "kernel void resolve_present(texture2d<float> hr [[texture(0)]],\n"
+    "                            texture2d<float, access::write> out [[texture(1)]],\n"
+    "                            constant Present &p [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
+    "    if (g.x >= p.out.x || g.x >= out.get_width() || g.y >= out.get_height()) return;\n"
+    "    if (g.y >= p.out.y) {\n"
+    "        if ((p.flags & 1u) && g.y == p.out.y) out.write(float4(0.0, 0.0, 0.0, 1.0), g);\n"
+    "        return;\n"
+    "    }\n"
+    "    constexpr sampler sm(coord::pixel, filter::linear, address::clamp_to_edge);\n"
+    "    float2 fp = p.size / float2(p.out);\n"
+    "    float2 lo = p.origin + 0.5, hi = p.origin + p.size - 0.5;\n"
+    "    float4 c;\n"
+    "    if (fp.x > 1.25 || fp.y > 1.25) {\n"
+    "        float2 nf = clamp(ceil(fp * 0.5), float2(1.0), float2(8.0));\n"
+    "        int2 n = int2(nf);\n"
+    "        float2 st = fp / nf;\n"
+    "        float2 base = p.origin + float2(g) * fp + 0.5 * st;\n"
+    "        float4 acc = float4(0.0);\n"
+    "        for (int j = 0; j < n.y; j++)\n"
+    "            for (int i = 0; i < n.x; i++)\n"
+    "                acc += hr.sample(sm, clamp(base + float2(i, j) * st, lo, hi));\n"
+    "        c = acc / float(n.x * n.y);\n"
+    "    } else {\n"
+    "        c = hr.sample(sm, clamp(p.origin + (float2(g) + 0.5) * fp, lo, hi));\n"
+    "    }\n"
+    "    out.write(float4(min(c.rgb * (255.0 / 248.0), 1.0), 1.0), g);\n"
+    "}\n"
+    /* FXAA ([video] antialiasing_mode) on the presented image, ported from
+     * postfx_chain.c's FXAA_FS; quality 1 is fxaa_hq. */
+    "static float fx_l(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+    "kernel void fxaa_present(texture2d<float> src [[texture(0)]],\n"
+    "                         texture2d<float, access::write> out [[texture(1)]],\n"
+    "                         constant Present &p [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
+    "    if (g.x >= p.out.x || g.x >= out.get_width() || g.y >= out.get_height()) return;\n"
+    "    if (g.y >= p.out.y) {   /* the black row under the image */\n"
+    "        if (g.y == p.out.y) out.write(float4(0.0, 0.0, 0.0, 1.0), g);\n"
+    "        return;\n"
+    "    }\n"
+    "    constexpr sampler sm(coord::normalized, filter::linear, address::clamp_to_edge);\n"
+    "    float2 rcp = 1.0 / float2(src.get_width(), src.get_height());\n"
+    "    float2 lim = float2(p.out) * rcp;\n"
+    "    float2 v = (float2(g) + 0.5) * rcp;\n"
+    "    #define LS(q) fx_l(src.sample(sm, min(q, lim - 0.5 * rcp), level(0.0)).rgb)\n"
+    "    float3 cM = src.sample(sm, v, level(0.0)).rgb; float lM = fx_l(cM);\n"
+    "    float lN = LS(v + float2(0.0, rcp.y)), lS = LS(v - float2(0.0, rcp.y));\n"
+    "    float lE = LS(v + float2(rcp.x, 0.0)), lW = LS(v - float2(rcp.x, 0.0));\n"
+    "    float mx = max(lM, max(max(lN, lS), max(lE, lW)));\n"
+    "    float mn = min(lM, min(min(lN, lS), min(lE, lW)));\n"
+    "    float range = mx - mn;\n"
+    "    bool hq = (p.flags & 2u) != 0u;\n"
+    "    float thr = hq ? 0.0417 : 0.0625;\n"
+    "    if (range < max(thr, mx * 0.125)) { out.write(float4(cM, 1.0), g); return; }\n"
+    "    float lNE = LS(v + rcp), lSW = LS(v - rcp);\n"
+    "    float lNW = LS(v + float2(-rcp.x, rcp.y)), lSE = LS(v + float2(rcp.x, -rcp.y));\n"
+    "    float eH = abs(lNW + lNE - 2.0 * lN) + 2.0 * abs(lW + lE - 2.0 * lM) + abs(lSW + lSE - 2.0 * lS);\n"
+    "    float eV = abs(lNW + lSW - 2.0 * lW) + 2.0 * abs(lN + lS - 2.0 * lM) + abs(lNE + lSE - 2.0 * lE);\n"
+    "    bool horz = eH >= eV;\n"
+    "    float l1 = horz ? lS : lW, l2 = horz ? lN : lE;\n"
+    "    float g1 = abs(l1 - lM), g2 = abs(l2 - lM);\n"
+    "    bool neg = g1 >= g2;\n"
+    "    float grad = 0.25 * max(g1, g2);\n"
+    "    float stp = horz ? rcp.y : rcp.x;\n"
+    "    float lLocal; if (neg) { stp = -stp; lLocal = 0.5 * (l1 + lM); } else lLocal = 0.5 * (l2 + lM);\n"
+    "    float2 q0 = v; if (horz) q0.y += 0.5 * stp; else q0.x += 0.5 * stp;\n"
+    "    float2 off = horz ? float2(rcp.x, 0.0) : float2(0.0, rcp.y);\n"
+    "    float2 p1 = q0 - off, p2 = q0 + off;\n"
+    "    float e1 = LS(p1) - lLocal, e2 = LS(p2) - lLocal;\n"
+    "    bool d1 = abs(e1) >= grad, d2 = abs(e2) >= grad;\n"
+    "    int steps = hq ? 12 : 8;\n"
+    "    for (int i = 1; i < steps && !(d1 && d2); i++) {\n"
+    "        float k = i < 2 ? 1.0 : (i < 5 ? 1.5 : (i < 8 ? 2.0 : 4.0));\n"
+    "        if (!d1) { p1 -= off * k; e1 = LS(p1) - lLocal; d1 = abs(e1) >= grad; }\n"
+    "        if (!d2) { p2 += off * k; e2 = LS(p2) - lLocal; d2 = abs(e2) >= grad; }\n"
+    "    }\n"
+    "    float dist1 = horz ? v.x - p1.x : v.y - p1.y;\n"
+    "    float dist2 = horz ? p2.x - v.x : p2.y - v.y;\n"
+    "    bool near1 = dist1 < dist2; float dmin = min(dist1, dist2);\n"
+    "    float len = dist1 + dist2;\n"
+    "    bool mLess = (lM - lLocal) < 0.0;\n"
+    "    bool good = ((near1 ? e1 : e2) < 0.0) != mLess;\n"
+    "    float eo = good ? (0.5 - dmin / len) : 0.0;\n"
+    "    float avg = (2.0 * (lN + lS + lE + lW) + lNE + lNW + lSE + lSW) / 12.0;\n"
+    "    float sp = clamp(abs(avg - lM) / range, 0.0, 1.0);\n"
+    "    sp = (-2.0 * sp + 3.0) * sp * sp; sp = sp * sp * 0.75;\n"
+    "    float fz = max(eo, sp);\n"
+    "    float2 q = v; if (horz) q.y += fz * stp; else q.x += fz * stp;\n"
+    "    out.write(float4(src.sample(sm, q, level(0.0)).rgb, 1.0), g);\n"
+    "    #undef LS\n"
+    "}\n"
     /* Native VRAM from the image, as OpenGL's pack pass: each native pixel
      * is the top-left sample of its S x S block. */
     "kernel void pack(texture2d<float, access::read> hr [[texture(0)]],\n"
@@ -208,17 +304,89 @@ static NSString *const k_source =
     "static float3 col5(int c) {\n"
     "    return float3(float(c & 31), float((c >> 5) & 31), float((c >> 10) & 31)) * (8.0 / 255.0);\n"
     "}\n"
+    /* Texture filters, as gpu_gl_renderer.c's TEX program: neighbours clamp
+     * to the primitive's uv bounds (no atlas bleed) unless a texture window
+     * repeats the page. */
+    "static int stable_texel(const device ushort *raw, VOut in, int2 p) {\n"
+    "    if ((in.twin & 1023u) == 0u) p = clamp(p, in.lim.xy, in.lim.zw);\n"
+    "    return fetch_texel(raw, in, p.x, p.y);\n"
+    "}\n"
+    "static int neighbour_texel(const device ushort *raw, VOut in, int2 b, int2 p) {\n"
+    "    if ((in.twin & 1023u) == 0u) { int2 pg = b & int2(~255); p = clamp(p, pg + in.lim.xy, pg + in.lim.zw); }\n"
+    "    return fetch_texel(raw, in, p.x, p.y);\n"
+    "}\n"
+    /* xBR after Hyllian (MIT; THIRD_PARTY_ATTRIBUTION.md), as OpenGL's. */
+    "static float xbr_d(int a, int b) {\n"
+    "    float3 dv = col5(a) - col5(b);\n"
+    "    float yy = dot(dv, float3(0.299, 0.587, 0.114));\n"
+    "    float uu = dot(dv, float3(-0.169, -0.331, 0.5)), vv = dot(dv, float3(0.5, -0.419, -0.081));\n"
+    "    return 48.0 * abs(yy) + 7.0 * abs(uu) + 6.0 * abs(vv) + (((a == 0) != (b == 0)) ? 64.0 : 0.0);\n"
+    "}\n"
+    "static int xbr_at(const device ushort *raw, VOut in, int2 e, int2 s, int x, int y) {\n"
+    "    return stable_texel(raw, in, e + int2(x * s.x, y * s.y));\n"
+    "}\n"
+    "static float3 xbr_sample(const device ushort *raw, VOut in, float2 uv, int E, float2 fw) {\n"
+    "    int2 e = int2(floor(uv)); float2 f = fract(uv);\n"
+    "    int2 s = int2(f.x < 0.5 ? -1 : 1, f.y < 0.5 ? -1 : 1);\n"
+    "    float2 l = float2(s.x > 0 ? f.x : 1.0 - f.x, s.y > 0 ? f.y : 1.0 - f.y);\n"
+    "    if (max(fw.x, fw.y) >= 0.5) return col5(E);\n"
+    "    int F = xbr_at(raw, in, e, s, 1, 0), H = xbr_at(raw, in, e, s, 0, 1);\n"
+    "    if (E == F || E == H) return col5(E);\n"
+    "    int I = xbr_at(raw, in, e, s, 1, 1);\n"
+    "    int B = xbr_at(raw, in, e, s, 0, -1), C = xbr_at(raw, in, e, s, 1, -1);\n"
+    "    int D = xbr_at(raw, in, e, s, -1, 0), G = xbr_at(raw, in, e, s, -1, 1);\n"
+    "    int F4 = xbr_at(raw, in, e, s, 2, 0), I4 = xbr_at(raw, in, e, s, 2, 1);\n"
+    "    int H5 = xbr_at(raw, in, e, s, 0, 2), I5 = xbr_at(raw, in, e, s, 1, 2);\n"
+    "    float we = xbr_d(E, C) + xbr_d(E, G) + xbr_d(I, H5) + xbr_d(I, F4) + 4.0 * xbr_d(H, F);\n"
+    "    float wi = xbr_d(H, D) + xbr_d(H, I5) + xbr_d(F, I4) + xbr_d(F, B) + 4.0 * xbr_d(E, I);\n"
+    "    if (!(we < wi)) return col5(E);\n"
+    "    int px = xbr_d(E, F) <= xbr_d(E, H) ? F : H;\n"
+    "    if (px == 0) return col5(E);\n"
+    "    float w = max(fw.x + fw.y, 1e-3);\n"
+    "    float a = clamp((l.x + l.y - 1.5) / w + 0.5, 0.0, 1.0);\n"
+    "    return mix(col5(E), col5(px), a);\n"
+    "}\n"
     /* Flags: 1 textured, 2 raw texture, 4..8 depth, 16 dithered, 32..128
      * semi mode + 1 (0 = opaque), 256 set mask, 512 check mask. */
     "fragment float4 draw_fs(VOut in [[stage_in]], float4 dst [[color(0)]],\n"
     "                        const device ushort *raw [[buffer(0)]], constant U &u [[buffer(1)]]) {\n"
     "    uint f = in.flags;\n"
+    "    float2 uv = in.uv, ddx = dfdx(uv), ddy = dfdy(uv);\n"
     "    if ((f & 512u) && dst.a >= 0.5) discard_fragment();\n"
     "    float3 rgb = in.col.rgb; uint stp = 0u;\n"
     "    if (f & 1u) {\n"
-    "        int t = fetch_texel(raw, in, int(floor(in.uv.x)), int(floor(in.uv.y)));\n"
-    "        if (t == 0) discard_fragment();\n"
-    "        rgb = col5(t); stp = uint(t >> 15) & 1u;\n"
+    "        uint fm = (f >> 10) & 3u;   /* 0 nearest, 1 bilinear, 3 xBR */\n"
+    "        if (fm == 3u) {\n"
+    "            int t = stable_texel(raw, in, int2(floor(uv)));\n"
+    "            if (t == 0) discard_fragment();\n"
+    "            stp = uint(t >> 15) & 1u;\n"
+    "            rgb = xbr_sample(raw, in, uv, t, abs(ddx) + abs(ddy));\n"
+    "        } else if (fm == 1u) {\n"
+    "            float2 q = uv + float2(u.shift);\n"
+    "            int iu = int(floor(q.x)), iv = int(floor(q.y));\n"
+    "            float fx = q.x - float(iu) - 0.5, fy = q.y - float(iv) - 0.5;\n"
+    "            int sx = fx < 0.0 ? -1 : 1, sy = fy < 0.0 ? -1 : 1;\n"
+    "            fx = abs(fx); fy = abs(fy);\n"
+    "            int c00 = fetch_texel(raw, in, iu, iv);\n"
+    "            if (c00 == 0) discard_fragment();\n"
+    "            int2 b = int2(iu, iv);\n"
+    "            int c10 = neighbour_texel(raw, in, b, int2(iu + sx, iv));\n"
+    "            int c01 = neighbour_texel(raw, in, b, int2(iu, iv + sy));\n"
+    "            int c11 = neighbour_texel(raw, in, b, int2(iu + sx, iv + sy));\n"
+    "            float w00 = (1.0 - fx) * (1.0 - fy);\n"
+    "            float w10 = (c10 == 0 ? 0.0 : 1.0) * fx * (1.0 - fy);\n"
+    "            float w01 = (c01 == 0 ? 0.0 : 1.0) * (1.0 - fx) * fy;\n"
+    "            float w11 = (c11 == 0 ? 0.0 : 1.0) * fx * fy;\n"
+    "            float opac = w00 + w10 + w01 + w11;\n"
+    "            rgb = (col5(c00) * w00 + col5(c10) * w10 + col5(c01) * w01 + col5(c11) * w11) / opac;\n"
+    "            float stpf = (float((c00 >> 15) & 1) * w00 + float((c10 >> 15) & 1) * w10\n"
+    "                        + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;\n"
+    "            stp = stpf >= 0.5 ? 1u : 0u;\n"
+    "        } else {\n"
+    "            int t = fetch_texel(raw, in, int(floor(uv.x)), int(floor(uv.y)));\n"
+    "            if (t == 0) discard_fragment();\n"
+    "            rgb = col5(t); stp = uint(t >> 15) & 1u;\n"
+    "        }\n"
     "        if (!(f & 2u)) rgb = clamp(rgb * in.col.rgb * (255.0 / 128.0), 0.0, 1.0);\n"
     "    }\n"
     "    if ((f & 16u) && u.dither != 0u) {\n"
@@ -241,7 +409,7 @@ static NSString *const k_source =
 static id<MTLDevice> s_device;
 static id<MTLCommandQueue> s_queue;
 static id<MTLComputePipelineState> s_fill, s_upload, s_gather, s_scatter, s_export, s_pack,
-    s_export_present;
+    s_export_present, s_resolve_present, s_fxaa_present;
 static id<MTLRenderPipelineState> s_draw;
 static id<MTLRenderCommandEncoder> s_render;
 static id<MTLTexture> s_hr, s_scratch;
@@ -259,6 +427,7 @@ static int s_stale_y0 = VRAM_H, s_stale_y1 = -1;   /* stale native rows */
 static int s_drawn, s_drawn_x0, s_drawn_y0, s_drawn_x1, s_drawn_y1;
 static int s_semi_en, s_semi_mode, s_mod_r = 128, s_mod_g = 128, s_mod_b = 128, s_mod_raw;
 static uint32_t s_twin;
+static int s_tex_filter;   /* [video] texture_filtering: 0 nearest, 1 bilinear, 2 stable, 3 xBR */
 static int s_dither_bit, s_dither_mode = 1;   /* as gpu_gl_renderer.c: native-grid dithering */
 
 static id<MTLComputePipelineState> pipeline(id<MTLLibrary> library, NSString *name) {
@@ -303,6 +472,8 @@ static int device_ready(void) {
     s_export = pipeline(library, @"export_hires");
     s_pack = pipeline(library, @"pack");
     s_export_present = pipeline(library, @"export_present");
+    s_resolve_present = pipeline(library, @"resolve_present");
+    s_fxaa_present = pipeline(library, @"fxaa_present");
     MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
     rd.vertexFunction = [library newFunctionWithName:@"draw_vs"];
     rd.fragmentFunction = [library newFunctionWithName:@"draw_fs"];
@@ -310,6 +481,7 @@ static int device_ready(void) {
     s_draw = [s_device newRenderPipelineStateWithDescriptor:rd error:&error];
     s_queue = [s_device newCommandQueue];
     ok = s_fill && s_upload && s_gather && s_scatter && s_export && s_pack && s_export_present &&
+         s_resolve_present && s_fxaa_present &&
          s_draw && s_queue;
     return ok;
 }
@@ -504,6 +676,7 @@ static void mb_init(uint16_t *vram) {
     s_mod_raw = 0;
     s_twin = 0;
     s_dither_bit = 0;
+    s_tex_filter = 0;
     s_drawn = 0;
     sw_get_draw_area(&s_clip[0], &s_clip[1], &s_clip[2], &s_clip[3]);
     s_ready = 0;
@@ -514,8 +687,13 @@ static void mb_init(uint16_t *vram) {
 
 static int mb_scale(void) { return s_scale; }
 
-static void mb_set_texture_filter(int bilinear) { sw_set_texture_filter(bilinear); }
-static int mb_texture_filter(void) { return sw_texture_filter(); }
+/* [video] texture_filtering, as the OpenGL backend keeps it: 0 nearest,
+ * 1 bilinear, 2 stable world, 3 xBR (s_tex_filter). */
+static void mb_set_texture_filter(int filter) {
+    s_tex_filter = filter >= 0 && filter <= 3 ? filter : 0;
+    sw_set_texture_filter(filter != 0);
+}
+static int mb_texture_filter(void) { return s_tex_filter; }
 static void mb_set_semi(int enabled, int mode) {
     s_semi_en = enabled ? 1 : 0;
     s_semi_mode = mode & 3;
@@ -797,7 +975,11 @@ static void textured(const int *xs, const int *ys, const int *us_in, const int *
     int depth = (tp >> 7) & 3;
     if (depth > 2) depth = 2;
     pack_if_sampling(base_x, base_y, depth, cx, cy);
-    uint32_t f = prim_flags(semi, dither && !raw) | VF_TEXTURED | ((uint32_t)depth << 2);
+    /* Stable world filters PGXP-tracked world geometry only; this backend has
+     * no PGXP input yet, so like OpenGL without it every texel stays nearest. */
+    const uint32_t filter = s_tex_filter == 2 ? 0u : (uint32_t)s_tex_filter;
+    uint32_t f = prim_flags(semi, dither && !raw) | VF_TEXTURED | ((uint32_t)depth << 2) |
+                 (filter << 10);
     if (raw) f |= VF_RAW;
     MetalVtx v[3];
     memset(v, 0, sizeof v);
@@ -937,18 +1119,27 @@ static int mb_render_display_hires(uint32_t *out, int pitch, int dx, int dy, int
 }
 
 /* ---- Direct present ------------------------------------------------------
- * The window's present texture is an IOSurface the backend also wraps as a
- * Metal texture. Each frame the display decode writes it on the GPU; SDL's
- * Metal renderer samples the same surface, so no frame crosses to the CPU. */
+ * The window's present textures are two IOSurfaces the backend also wraps
+ * as Metal textures. Each frame the GPU writes one while SDL may still be
+ * sampling the other, then SDL's Metal renderer draws it: no frame crosses
+ * to the CPU. */
 
-static CVPixelBufferRef s_present_pb;
-static id<MTLTexture> s_present_tex;
+static CVPixelBufferRef s_present_pb[2];
+static id<MTLTexture> s_present_tex[2];
+static id<MTLTexture> s_present_mid;   /* FXAA's input */
 
-void *metal_renderer_present_pixel_buffer(int width, int height) {
-    if (!device_ready() || width <= 0 || height <= 0) return NULL;
-    if (s_present_pb && (int)CVPixelBufferGetWidth(s_present_pb) >= width &&
-        (int)CVPixelBufferGetHeight(s_present_pb) >= height)
-        return s_present_pb;
+typedef struct {
+    float origin[2], size[2];
+    uint32_t out[2];
+    uint32_t flags, pad;
+} MetalPresent;
+
+void *metal_renderer_present_pixel_buffer(int index, int width, int height) {
+    if (index < 0 || index > 1 || !device_ready() || width <= 0 || height <= 0) return NULL;
+    CVPixelBufferRef cur = s_present_pb[index];
+    if (cur && (int)CVPixelBufferGetWidth(cur) >= width &&
+        (int)CVPixelBufferGetHeight(cur) >= height)
+        return cur;
     if (s_ready) metal_renderer_finish();
     NSDictionary *attrs = @{
         (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
@@ -972,30 +1163,80 @@ void *metal_renderer_present_pixel_buffer(int width, int height) {
         CVPixelBufferRelease(pb);
         return NULL;
     }
-    if (s_present_pb) CVPixelBufferRelease(s_present_pb);
-    s_present_pb = pb;
-    s_present_tex = tex;
-    return s_present_pb;
+    if (cur) CVPixelBufferRelease(cur);
+    s_present_pb[index] = pb;
+    s_present_tex[index] = tex;
+    return pb;
 }
 
-int metal_renderer_present_direct(int dx, int dy, int dw, int dh, int pad_row) {
-    if (!s_ready || !s_present_tex || dw <= 0 || dh <= 0) return 0;
-    const int S = s_scale;
-    if ((NSUInteger)(dw * S) > s_present_tex.width || (NSUInteger)(dh * S) > s_present_tex.height)
+/* A private texture of at least w x h for FXAA's input. */
+static id<MTLTexture> present_mid(NSUInteger w, NSUInteger h) {
+    if (s_present_mid && s_present_mid.width >= w && s_present_mid.height >= h) return s_present_mid;
+    MTLTextureDescriptor *d =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                           width:w height:h mipmapped:NO];
+    d.storageMode = MTLStorageModePrivate;
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    s_present_mid = [s_device newTextureWithDescriptor:d];
+    return s_present_mid;
+}
+
+int metal_renderer_present_direct(int index, int dx, int dy, int dw, int dh,
+                                  int out_w, int out_h, int aa, int *img_w, int *img_h) {
+    if (index < 0 || index > 1 || !s_ready || !s_present_tex[index] || dw <= 0 || dh <= 0)
         return 0;
-    MetalOp op = {0};
-    op.x = dx & (VRAM_W - 1);
-    op.y = dy & (VRAM_H - 1);
-    op.w = dw;
-    op.h = dh;
-    op.scale = (uint32_t)S;
-    op.flags = pad_row ? 1u : 0u;
+    id<MTLTexture> target = s_present_tex[index];
+    const int S = s_scale;
+    const int iw = dw * S, ih = dh * S;
+    /* OpenGL resolves the area of a source more than 1.25x the output. */
+    const int resolve = out_w > 0 && out_h > 0 &&
+        ((float)iw > 1.25f * (float)out_w || (float)ih > 1.25f * (float)out_h);
+    const int w = resolve ? out_w : iw, h = resolve ? out_h : ih;
+    if ((NSUInteger)w > target.width || (NSUInteger)h > target.height) return 0;
+    id<MTLTexture> first = target;
+    if (aa) {
+        first = present_mid((NSUInteger)w, (NSUInteger)h + 1);
+        if (!first) return 0;
+    }
     id<MTLComputeCommandEncoder> e = encoder();
-    [e setTexture:s_hr atIndex:0];
-    [e setTexture:s_present_tex atIndex:1];
-    dispatch(s_export_present, &op, (NSUInteger)dw * S, (NSUInteger)dh * S + (pad_row ? 1u : 0u));
+    if (resolve) {
+        MetalPresent p = {{(float)((dx & (VRAM_W - 1)) * S), (float)((dy & (VRAM_H - 1)) * S)},
+                          {(float)iw, (float)ih}, {(uint32_t)w, (uint32_t)h}, 1u, 0u};
+        [e setComputePipelineState:s_resolve_present];
+        [e setTexture:s_hr atIndex:0];
+        [e setTexture:first atIndex:1];
+        [e setBytes:&p length:sizeof p atIndex:0];
+        const NSUInteger tw = s_resolve_present.threadExecutionWidth;
+        const NSUInteger th = s_resolve_present.maxTotalThreadsPerThreadgroup / tw;
+        [e dispatchThreads:MTLSizeMake((NSUInteger)w, (NSUInteger)h + 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+    } else {
+        MetalOp op = {0};
+        op.x = dx & (VRAM_W - 1);
+        op.y = dy & (VRAM_H - 1);
+        op.w = dw;
+        op.h = dh;
+        op.scale = (uint32_t)S;
+        op.flags = 1u;
+        [e setTexture:s_hr atIndex:0];
+        [e setTexture:first atIndex:1];
+        dispatch(s_export_present, &op, (NSUInteger)iw, (NSUInteger)ih + 1u);
+    }
+    if (aa) {
+        MetalPresent p = {{0, 0}, {0, 0}, {(uint32_t)w, (uint32_t)h}, aa == 2 ? 2u : 0u, 0u};
+        [e setComputePipelineState:s_fxaa_present];
+        [e setTexture:first atIndex:0];
+        [e setTexture:target atIndex:1];
+        [e setBytes:&p length:sizeof p atIndex:0];
+        const NSUInteger tw = s_fxaa_present.threadExecutionWidth;
+        const NSUInteger th = s_fxaa_present.maxTotalThreadsPerThreadgroup / tw;
+        [e dispatchThreads:MTLSizeMake((NSUInteger)w, (NSUInteger)h + 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+    }
     /* SDL samples the surface on its own queue: the image must be complete. */
     metal_renderer_finish();
+    if (img_w) *img_w = w;
+    if (img_h) *img_h = h;
     return 1;
 }
 

@@ -541,6 +541,23 @@ static int           sdl_texture_width = 0;
 /* --renderer metal: sdl_texture wraps the backend's IOSurface, which the GPU
  * writes each frame (metal_renderer_present_direct). No frame upload. */
 static bool          sdl_texture_direct = false;
+/* The two surfaces' textures; sdl_texture is the one written last. */
+static SDL_Texture*  sdl_direct_tex[2] = {nullptr, nullptr};
+static int           sdl_direct_next = 0;
+
+/* The window pixels the present's dst rect covers (letterbox logical
+ * presentation of g_logical_w x 480*S), as the SDL branch below lays it out. */
+static void direct_output_size(bool pin_43, uint32_t present_h, int *out_w, int *out_h);
+
+static void destroy_sdl_present_textures(void) {
+    for (SDL_Texture*& t : sdl_direct_tex) {
+        if (t && t != sdl_texture) SDL_DestroyTexture(t);
+        t = nullptr;
+    }
+    if (sdl_texture) SDL_DestroyTexture(sdl_texture);
+    sdl_texture = nullptr;
+    sdl_texture_direct = false;
+}
 static int           sdl_texture_height = 0;
 
 typedef void (*ModFrameHook)(void);
@@ -2588,11 +2605,14 @@ static int ensure_sdl_present_texture(int min_width, int min_height) {
     const int width = std::max(min_width, sdl_texture_width);
     const int height = std::max(min_height, sdl_texture_height);
     SDL_Texture* next = nullptr;
+    SDL_Texture* other = nullptr;
     bool direct = false;
 #ifdef PSX_METAL_RENDERER
     if (gr_backend() == GR_BACKEND_METAL && !netplay_cpu_auth_gpu()) {
-        void *pb = metal_renderer_present_pixel_buffer(width, height);
-        if (pb) {
+        SDL_Texture* made[2] = {nullptr, nullptr};
+        for (int i = 0; i < 2; ++i) {
+            void *pb = metal_renderer_present_pixel_buffer(i, width, height);
+            if (!pb) break;
             SDL_PropertiesID props = SDL_CreateProperties();
             SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER,
                                   SDL_PIXELFORMAT_ARGB8888);
@@ -2601,12 +2621,18 @@ static int ensure_sdl_present_texture(int min_width, int min_height) {
             SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, width);
             SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, height);
             SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_PIXELBUFFER_POINTER, pb);
-            next = SDL_CreateTextureWithProperties(sdl_renderer, props);
+            made[i] = SDL_CreateTextureWithProperties(sdl_renderer, props);
             SDL_DestroyProperties(props);
-            direct = next != nullptr;
-            if (!direct)
-                std::fprintf(stdout, "psxrecomp: Metal direct present unavailable (%s); "
-                                     "frames are read back\n", SDL_GetError());
+        }
+        direct = made[0] && made[1];
+        if (direct) {
+            next = made[0];
+            other = made[1];
+        } else {
+            for (SDL_Texture* t : made)
+                if (t) SDL_DestroyTexture(t);
+            std::fprintf(stdout, "psxrecomp: Metal direct present unavailable (%s); "
+                                 "frames are read back\n", SDL_GetError());
         }
     }
 #endif
@@ -2620,12 +2646,37 @@ static int ensure_sdl_present_texture(int min_width, int min_height) {
     }
     SDL_SetTextureScaleMode(next,
                             g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
-    if (sdl_texture) SDL_DestroyTexture(sdl_texture);
+    destroy_sdl_present_textures();
     sdl_texture = next;
     sdl_texture_width = width;
     sdl_texture_height = height;
     sdl_texture_direct = direct;
+    if (direct) {
+        SDL_SetTextureScaleMode(other,
+                                g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+        sdl_direct_tex[0] = next;
+        sdl_direct_tex[1] = other;
+        sdl_direct_next = 0;
+    }
     return 0;
+}
+
+static void direct_output_size(bool pin_43, uint32_t present_h, int *out_w, int *out_h) {
+    *out_w = *out_h = 0;
+    int ow = 0, oh = 0;
+    if (!sdl_renderer || !SDL_GetCurrentRenderOutputSize(sdl_renderer, &ow, &oh) ||
+        ow <= 0 || oh <= 0 || g_logical_w <= 0)
+        return;
+    const int lh = 480 * g_video_scale;
+    const double k = std::min((double)ow / (double)g_logical_w, (double)oh / (double)lh);
+    const int dst_w = pin_43 ? 640 * g_video_scale : g_logical_w;
+    int dst_h = lh;
+    if (pin_43 && present_h > 0 && present_h < 240) {
+        dst_h = (dst_h * (int)present_h) / 240;
+        if (dst_h < 1) dst_h = 1;
+    }
+    *out_w = (int)std::lround(dst_w * k);
+    *out_h = (int)std::lround(dst_h * k);
 }
 
 /* Create SDL_Renderer + streaming texture for software present. Used when
@@ -4511,7 +4562,7 @@ static void teardown_game_session_keep_lobby(void) {
         hw_renderer()->shutdown();
         g_gl_active = false;
     }
-    if (sdl_texture) { SDL_DestroyTexture(sdl_texture); sdl_texture = nullptr; }
+    destroy_sdl_present_textures();
     sdl_texture_width = sdl_texture_height = 0;
     if (sdl_renderer) { SDL_DestroyRenderer(sdl_renderer); sdl_renderer = nullptr; }
     if (sdl_window) { SDL_DestroyWindow(sdl_window); sdl_window = nullptr; }
@@ -10651,6 +10702,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     bool local_viewport_crop_applied = false;
     bool game_view_applied = false;
     bool direct_present = false;   /* the GPU wrote sdl_texture itself */
+    int direct_w = 0, direct_h = 0;   /* the size it wrote */
     uint32_t gv_x = 0, gv_y = 0, gv_w = 0, gv_h = 0;
     if (s_force_present_after_load && g_gl_active)
         hw_renderer()->flush_cpu_uploads();
@@ -10920,12 +10972,19 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             /* Never hires-present under netplay CPU-auth (even if settings say
              * 4× — that preference is offline-only). */
 #ifdef PSX_METAL_RENDERER
+            int out_w = 0, out_h = 0;
+            if (active_scale > 1 && sdl_texture_direct && sdl_renderer)
+                direct_output_size(pin_43, present_h, &out_w, &out_h);
             if (active_scale > 1 && sdl_texture_direct && !game_view && !g_gl_active &&
                 !netplay_cpu_auth_gpu() &&
-                metal_renderer_present_direct((int)di.display_x, (int)di.display_y,
-                                              (int)present_w, (int)h, 1))
+                metal_renderer_present_direct(sdl_direct_next, (int)di.display_x,
+                                              (int)di.display_y, (int)present_w, (int)h,
+                                              out_w, out_h, g_video_post_aa,
+                                              &direct_w, &direct_h)) {
                 direct_present = true;
-            else
+                sdl_texture = sdl_direct_tex[sdl_direct_next];
+                sdl_direct_next ^= 1;
+            } else
 #endif
             if (active_scale > 1 && !netplay_cpu_auth_gpu()) {
                 int sw = (int)present_w * active_scale;
@@ -10981,6 +11040,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     if (game_view_applied) {
         src_w = (int)gv_w * active_scale;
         src_h = (int)gv_h * active_scale;
+    }
+    if (direct_present) {   /* resolved to the window, or the internal image */
+        src_w = direct_w;
+        src_h = direct_h;
     }
     if (g_gl_active) {
         /* OpenGL present: upload the active display rect and draw a full-screen
@@ -11067,6 +11130,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     {
         static int s_sw_scale_nearest = -1;
         const int want_nearest = depth24_frame || !g_video_aa;
+        if (direct_present) s_sw_scale_nearest = -1;   /* the textures alternate */
         if (s_sw_scale_nearest != want_nearest) {
             SDL_SetTextureScaleMode(sdl_texture,
                                     want_nearest ? SDL_ScaleModeNearest
@@ -23728,7 +23792,7 @@ session_reboot:
 
     shutdown_runtime();
     if (g_gl_active) hw_renderer()->shutdown();
-    SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
+    destroy_sdl_present_textures();   /* NULL-safe in GL mode */
     SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */
     SDL_DestroyWindow(sdl_window);
     SDL_DestroyWindow(s_headless_gl_window);

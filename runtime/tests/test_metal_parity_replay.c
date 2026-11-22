@@ -269,9 +269,14 @@ int main(int argc, char **argv) {
             if (w <= 0 || hh <= 0 || (size_t)w * hh > frame_cap) break;
             memset(frame, 0, (size_t)w * hh * 4);
             if (direct) {
+                /* Alternate the two surfaces, as the window does. */
+                const int slot = (int)(frames & 1);
                 CVPixelBufferRef pb = (CVPixelBufferRef)
-                    metal_renderer_present_pixel_buffer(1024 * scale, 512 * scale);
-                if (!pb || !metal_renderer_present_direct(a[1], a[2], a[3], a[4], 0)) {
+                    metal_renderer_present_pixel_buffer(slot, 1024 * scale, 512 * scale + 1);
+                int got_w = 0, got_h = 0;
+                if (!pb || !metal_renderer_present_direct(slot, a[1], a[2], a[3], a[4], 0, 0, 0,
+                                                          &got_w, &got_h) ||
+                    got_w != w || got_h != hh) {
                     fprintf(stderr, "FAIL direct present unavailable\n");
                     ok = 0;
                     break;
