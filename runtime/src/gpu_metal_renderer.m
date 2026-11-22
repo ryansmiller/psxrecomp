@@ -28,6 +28,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 
 enum { VRAM_W = 1024, VRAM_H = 512, MAX_SCALE = 16, STAGING_BYTES = 8u << 20 };
@@ -130,11 +131,98 @@ static NSString *const k_source =
     "    uint b = uint(rint(c.b * 255.0)) >> 3;\n"
     "    r = (r << 3) | (r >> 2); gg = (gg << 3) | (gg >> 2); b = (b << 3) | (b >> 2);\n"
     "    out[g.y * uint(o.w) * S + g.x] = 0xFF000000u | (r << 16) | (gg << 8) | b;\n"
+    "}\n"
+    /* Native VRAM from the image, as OpenGL's pack pass: each native pixel
+     * is the top-left sample of its S x S block. */
+    "kernel void pack(texture2d<float, access::read> hr [[texture(0)]],\n"
+    "                 device ushort *raw [[buffer(0)]], constant Op &o [[buffer(1)]],\n"
+    "                 uint2 g [[thread_position_in_grid]]) {\n"
+    "    if (g.x >= uint(o.w) || g.y >= uint(o.h)) return;\n"
+    "    uint nx = uint(o.x) + g.x, ny = uint(o.y) + g.y;\n"
+    "    float4 c = hr.read(uint2(nx, ny) * o.scale);\n"
+    "    uint r = uint(c.r * 255.0 + 0.5) >> 3, gg = uint(c.g * 255.0 + 0.5) >> 3;\n"
+    "    uint b = uint(c.b * 255.0 + 0.5) >> 3;\n"
+    "    raw[ny * 1024u + nx] = ushort(r | (gg << 5) | (b << 10) | (c.a >= 0.5 ? 0x8000u : 0u));\n"
+    "}\n"
+    /* Primitives, as gpu_gl_renderer.c's GEO and TEX programs. Blending and
+     * the mask check read the destination in the shader (Apple GPUs keep
+     * per-pixel submission order), so every mode is one pass. */
+    "struct Vtx { float2 pos, uv; float4 col; uint flags, page, clut, twin; int4 lim; };\n"
+    "struct U { float shift; uint scale, dither, pad; };\n"
+    "struct VOut {\n"
+    "    float4 position [[position]];\n"
+    "    float2 uv [[center_no_perspective]];\n"
+    "    float4 col [[center_no_perspective]];\n"
+    "    float2 npos [[center_no_perspective]];\n"
+    "    uint flags [[flat]]; uint page [[flat]]; uint clut [[flat]]; uint twin [[flat]];\n"
+    "    int4 lim [[flat]];\n"
+    "};\n"
+    "vertex VOut draw_vs(uint vid [[vertex_id]], constant Vtx *v [[buffer(0)]],\n"
+    "                    constant U &u [[buffer(1)]]) {\n"
+    "    Vtx x = v[vid]; VOut o;\n"
+    "    o.position = float4((x.pos.x + u.shift) / 512.0 - 1.0, 1.0 - (x.pos.y + u.shift) / 256.0, 0.0, 1.0);\n"
+    "    o.uv = x.uv; o.col = x.col; o.npos = x.pos;\n"
+    "    o.flags = x.flags; o.page = x.page; o.clut = x.clut; o.twin = x.twin; o.lim = x.lim;\n"
+    "    return o;\n"
+    "}\n"
+    "static int vram_at(const device ushort *raw, int x, int y) {\n"
+    "    return int(raw[uint(y & 511) * 1024u + uint(x & 1023)]);\n"
+    "}\n"
+    "static int fetch_texel(const device ushort *raw, VOut in, int u, int v) {\n"
+    "    u &= 255; v &= 255;\n"
+    "    int4 tw = int4(in.twin & 31u, (in.twin >> 5) & 31u, (in.twin >> 10) & 31u, (in.twin >> 15) & 31u);\n"
+    "    if ((tw.x | tw.y) != 0) {\n"
+    "        u = (u & ~(tw.x * 8)) | ((tw.z & tw.x) * 8);\n"
+    "        v = (v & ~(tw.y * 8)) | ((tw.w & tw.y) * 8);\n"
+    "    } else {\n"
+    "        u = clamp(u, in.lim.x, in.lim.z);\n"
+    "        v = clamp(v, in.lim.y, in.lim.w);\n"
+    "    }\n"
+    "    int px = int(in.page & 0xFFFFu), py = int(in.page >> 16);\n"
+    "    int cx = int(in.clut & 0xFFFFu), cy = int(in.clut >> 16);\n"
+    "    uint depth = (in.flags >> 2) & 3u;\n"
+    "    if (depth == 0u) return vram_at(raw, cx + ((vram_at(raw, px + (u >> 2), py + v) >> ((u & 3) * 4)) & 0xF), cy);\n"
+    "    if (depth == 1u) return vram_at(raw, cx + ((vram_at(raw, px + (u >> 1), py + v) >> ((u & 1) * 8)) & 0xFF), cy);\n"
+    "    return vram_at(raw, px + u, py + v);\n"
+    "}\n"
+    "static float3 col5(int c) {\n"
+    "    return float3(float(c & 31), float((c >> 5) & 31), float((c >> 10) & 31)) * (8.0 / 255.0);\n"
+    "}\n"
+    /* Flags: 1 textured, 2 raw texture, 4..8 depth, 16 dithered, 32..128
+     * semi mode + 1 (0 = opaque), 256 set mask, 512 check mask. */
+    "fragment float4 draw_fs(VOut in [[stage_in]], float4 dst [[color(0)]],\n"
+    "                        const device ushort *raw [[buffer(0)]], constant U &u [[buffer(1)]]) {\n"
+    "    uint f = in.flags;\n"
+    "    if ((f & 512u) && dst.a >= 0.5) discard_fragment();\n"
+    "    float3 rgb = in.col.rgb; uint stp = 0u;\n"
+    "    if (f & 1u) {\n"
+    "        int t = fetch_texel(raw, in, int(floor(in.uv.x)), int(floor(in.uv.y)));\n"
+    "        if (t == 0) discard_fragment();\n"
+    "        rgb = col5(t); stp = uint(t >> 15) & 1u;\n"
+    "        if (!(f & 2u)) rgb = clamp(rgb * in.col.rgb * (255.0 / 128.0), 0.0, 1.0);\n"
+    "    }\n"
+    "    if ((f & 16u) && u.dither != 0u) {\n"
+    "        const float m[16] = {-4.0,0.0,-3.0,1.0, 2.0,-2.0,3.0,-1.0, -3.0,1.0,-4.0,0.0, 3.0,-1.0,2.0,-2.0};\n"
+    "        int2 p = (u.dither == 2u ? int2(in.position.xy) : int2(floor(in.npos))) & 3;\n"
+    "        rgb = clamp(floor((rgb * 255.0 + m[p.y * 4 + p.x]) / 8.0), 0.0, 31.0) * (8.0 / 255.0);\n"
+    "    }\n"
+    "    uint semi = (f >> 5) & 7u;\n"
+    "    if (semi != 0u && (!(f & 1u) || stp != 0u)) {\n"
+    "        const float half_ = 128.0 / 255.0, quarter = 64.0 / 255.0;\n"
+    "        if (semi == 1u) rgb = dst.rgb * half_ + rgb * half_;\n"
+    "        else if (semi == 2u) rgb = dst.rgb + rgb;\n"
+    "        else if (semi == 3u) rgb = dst.rgb - rgb;\n"
+    "        else rgb = dst.rgb + rgb * quarter;\n"
+    "        rgb = clamp(rgb, 0.0, 1.0);\n"
+    "    }\n"
+    "    return float4(rgb, (stp != 0u || (f & 256u)) ? 1.0 : 0.0);\n"
     "}\n";
 
 static id<MTLDevice> s_device;
 static id<MTLCommandQueue> s_queue;
-static id<MTLComputePipelineState> s_fill, s_upload, s_gather, s_scatter, s_export;
+static id<MTLComputePipelineState> s_fill, s_upload, s_gather, s_scatter, s_export, s_pack;
+static id<MTLRenderPipelineState> s_draw;
+static id<MTLRenderCommandEncoder> s_render;
 static id<MTLTexture> s_hr, s_scratch;
 static id<MTLBuffer> s_raw, s_raw_scratch, s_staging, s_export_buf;
 static id<MTLCommandBuffer> s_command;
@@ -146,12 +234,11 @@ static int s_mask_set, s_mask_check;
 static int s_clip[4] = {0, 0, VRAM_W - 1, VRAM_H - 1};
 static int s_cpu_stale;           /* GPU wrote VRAM the CPU mirror lacks */
 static int s_stale_y0 = VRAM_H, s_stale_y1 = -1;   /* stale native rows */
-
-static void unimplemented(const char *what) {
-    char reason[160];
-    snprintf(reason, sizeof reason, "Metal renderer: %s is not implemented yet", what);
-    psx_fatal_halt(reason);
-}
+/* Native rect drawn since the last pack: s_raw lacks it until packed. */
+static int s_drawn, s_drawn_x0, s_drawn_y0, s_drawn_x1, s_drawn_y1;
+static int s_semi_en, s_semi_mode, s_mod_r = 128, s_mod_g = 128, s_mod_b = 128, s_mod_raw;
+static uint32_t s_twin;
+static int s_dither_bit, s_dither_mode = 1;   /* as gpu_gl_renderer.c: native-grid dithering */
 
 static id<MTLComputePipelineState> pipeline(id<MTLLibrary> library, NSString *name) {
     NSError *error = nil;
@@ -166,7 +253,21 @@ static int device_ready(void) {
     s_device = MTLCreateSystemDefaultDevice();
     /* RGBA8 read-write textures need tier 2 (every Apple-silicon GPU). */
     if (!s_device || s_device.readWriteTextureSupport < MTLReadWriteTextureTier2) return 0;
+    /* Drawing reads the destination pixel in the fragment shader. */
+    if (![s_device supportsFamily:MTLGPUFamilyApple1]) return 0;
+    /* Fast math reorders the shaders' float arithmetic: a modulated texel
+     * that lands on a half-step rounding tie then quantizes one step away
+     * from OpenGL and the software renderer. */
     MTLCompileOptions *options = [MTLCompileOptions new];
+    if (@available(macOS 15.0, *)) {
+        options.mathMode = MTLMathModeSafe;
+        options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        options.fastMathEnabled = NO;   /* the pre-macOS 15 equivalent */
+#pragma clang diagnostic pop
+    }
     NSError *error = nil;
     id<MTLLibrary> library = [s_device newLibraryWithSource:k_source options:options error:&error];
     if (!library) {
@@ -179,8 +280,14 @@ static int device_ready(void) {
     s_gather = pipeline(library, @"copy_gather");
     s_scatter = pipeline(library, @"copy_scatter");
     s_export = pipeline(library, @"export_hires");
+    s_pack = pipeline(library, @"pack");
+    MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+    rd.vertexFunction = [library newFunctionWithName:@"draw_vs"];
+    rd.fragmentFunction = [library newFunctionWithName:@"draw_fs"];
+    rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    s_draw = [s_device newRenderPipelineStateWithDescriptor:rd error:&error];
     s_queue = [s_device newCommandQueue];
-    ok = s_fill && s_upload && s_gather && s_scatter && s_export && s_queue;
+    ok = s_fill && s_upload && s_gather && s_scatter && s_export && s_pack && s_draw && s_queue;
     return ok;
 }
 
@@ -209,35 +316,98 @@ static int allocate(void) {
     return s_ready;
 }
 
-static id<MTLComputeCommandEncoder> encoder(void) {
-    if (!s_encoder) {
-        s_command = [s_queue commandBuffer];
-        s_encoder = [s_command computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+static id<MTLCommandBuffer> command(void) {
+    if (!s_command) s_command = [s_queue commandBuffer];
+    return s_command;
+}
+
+static id<MTLComputeCommandEncoder> compute(void) {
+    if (s_render) {
+        [s_render endEncoding];
+        s_render = nil;
     }
+    if (!s_encoder)
+        s_encoder = [command() computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
     return s_encoder;
+}
+
+static void mark_stale(int y, int h);
+static void dispatch_on(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> p,
+                        const MetalOp *op, NSUInteger w, NSUInteger h);
+
+/* Brings s_raw up to date with what primitives drew. */
+static void pack_drawn(void) {
+    if (!s_drawn) return;
+    s_drawn = 0;
+    MetalOp op = {0};
+    op.x = s_drawn_x0;
+    op.y = s_drawn_y0;
+    op.w = s_drawn_x1 - s_drawn_x0 + 1;
+    op.h = s_drawn_y1 - s_drawn_y0 + 1;
+    op.scale = (uint32_t)s_scale;
+    id<MTLComputeCommandEncoder> e = compute();
+    [e setTexture:s_hr atIndex:0];
+    [e setBuffer:s_raw offset:0 atIndex:0];
+    dispatch_on(e, s_pack, &op, (NSUInteger)op.w, (NSUInteger)op.h);
+    mark_stale(op.y, op.h);
+}
+
+/* The compute encoder, with native VRAM current. */
+static id<MTLComputeCommandEncoder> encoder(void) {
+    pack_drawn();
+    return compute();
+}
+
+static id<MTLRenderCommandEncoder> render(void) {
+    if (!s_render) {
+        if (s_encoder) {
+            [s_encoder endEncoding];
+            s_encoder = nil;
+        }
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = s_hr;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        s_render = [command() renderCommandEncoderWithDescriptor:pass];
+        [s_render setRenderPipelineState:s_draw];
+        [s_render setFragmentBuffer:s_raw offset:0 atIndex:0];
+    }
+    return s_render;
 }
 
 /* Submits queued work and waits for it. */
 void metal_renderer_finish(void) {
-    if (!s_encoder) return;
-    [s_encoder endEncoding];
+    pack_drawn();
+    if (s_render) {
+        [s_render endEncoding];
+        s_render = nil;
+    }
+    if (s_encoder) {
+        [s_encoder endEncoding];
+        s_encoder = nil;
+    }
+    if (!s_command) return;
     [s_command commit];
     [s_command waitUntilCompleted];
     if (s_command.status != MTLCommandBufferStatusCompleted)
         psx_fatal_halt("Metal renderer: a command buffer failed");
-    s_encoder = nil;
     s_command = nil;
     s_staging_used = 0;
 }
 
-static void dispatch(id<MTLComputePipelineState> p, const MetalOp *op, NSUInteger w, NSUInteger h) {
+static void dispatch_on(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> p,
+                        const MetalOp *op, NSUInteger w, NSUInteger h) {
     if (!w || !h) return;
-    id<MTLComputeCommandEncoder> e = encoder();
     [e setComputePipelineState:p];
     [e setBytes:op length:sizeof *op atIndex:1];
     const NSUInteger tw = p.threadExecutionWidth;
     const NSUInteger th = p.maxTotalThreadsPerThreadgroup / tw;
     [e dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+}
+
+/* Dispatches on the compute encoder the caller just took with encoder(). */
+static void dispatch(id<MTLComputePipelineState> p, const MetalOp *op, NSUInteger w, NSUInteger h) {
+    dispatch_on(s_encoder, p, op, w, h);
 }
 
 /* GPU wrote native rows y .. y+h-1 (wrapping); the CPU mirror lacks them. */
@@ -301,10 +471,17 @@ static void mb_set_scale(int scale) {
 }
 
 static void mb_init(uint16_t *vram) {
+    if (s_ready) metal_renderer_finish();
     s_vram = vram;
     sw_renderer_init(vram);   /* the CPU mirror's transfers and reads, at 1x */
     /* Draw state starts as sw_renderer_init leaves it. */
     s_mask_set = s_mask_check = 0;
+    s_semi_en = s_semi_mode = 0;
+    s_mod_r = s_mod_g = s_mod_b = 128;
+    s_mod_raw = 0;
+    s_twin = 0;
+    s_dither_bit = 0;
+    s_drawn = 0;
     sw_get_draw_area(&s_clip[0], &s_clip[1], &s_clip[2], &s_clip[3]);
     s_ready = 0;
     if (!device_ready() || !allocate()) psx_fatal_halt("Metal renderer: initialization failed");
@@ -316,14 +493,26 @@ static int mb_scale(void) { return s_scale; }
 
 static void mb_set_texture_filter(int bilinear) { sw_set_texture_filter(bilinear); }
 static int mb_texture_filter(void) { return sw_texture_filter(); }
-static void mb_set_semi(int enabled, int mode) { sw_set_semi_transparency(enabled, mode); }
+static void mb_set_semi(int enabled, int mode) {
+    s_semi_en = enabled ? 1 : 0;
+    s_semi_mode = mode & 3;
+    sw_set_semi_transparency(enabled, mode);
+}
 static void mb_set_mask_bits(int set_bit, int check_bit) {
     s_mask_set = set_bit;
     s_mask_check = check_bit;
     sw_set_mask_bits(set_bit, check_bit);
 }
-static void mb_set_texture_window(uint32_t raw) { sw_set_texture_window(raw); }
+static void mb_set_texture_window(uint32_t raw) {
+    s_twin = raw & 0xFFFFFu;
+    sw_set_texture_window(raw);
+}
+static void mb_set_dither(int enabled) { s_dither_bit = enabled ? 1 : 0; }
 static void mb_set_color_modulation(int r, int g, int b, int raw) {
+    s_mod_r = r;
+    s_mod_g = g;
+    s_mod_b = b;
+    s_mod_raw = raw ? 1 : 0;
     sw_set_color_modulation(r, g, b, raw);
 }
 
@@ -391,53 +580,309 @@ static void mb_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int 
         gpu_vram_dirty_mark_row((uint32_t)((op.y + row) & (VRAM_H - 1)));
 }
 
+/* ---- Primitives ----------------------------------------------------------
+ * As gpu_gl_renderer.c draws them: triangles in native VRAM coordinates,
+ * shifted by half an internal pixel less 1/64 (see its u_shift comment),
+ * colours in the k*8/255 basis, textures sampled from native VRAM with the
+ * shared gpu_uv.h centre-sampling model. Blending, the mask check and the
+ * mask bit happen in the fragment shader against the destination pixel. */
+
+#include "gpu_uv.h"
+
+typedef struct {
+    float pos[2], uv[2];
+    float col[4];
+    uint32_t flags, page, clut, twin;
+    int32_t lim[4];
+} MetalVtx;   /* matches the shader's Vtx: 64 bytes */
+
+typedef struct {
+    float shift;
+    uint32_t scale, dither, pad;
+} MetalU;
+
+enum {
+    VF_TEXTURED = 1u, VF_RAW = 2u, VF_DITHER = 16u, VF_SET_MASK = 256u, VF_CHECK_MASK = 512u
+};
+
+static int semi_code(void) { return s_semi_en ? s_semi_mode : -1; }
+
+/* Flags shared by every vertex of a primitive. */
+static uint32_t prim_flags(int semi, int dither) {
+    uint32_t f = 0;
+    if (semi >= 0) f |= (uint32_t)((semi & 3) + 1) << 5;
+    if (dither && s_dither_mode && s_dither_bit) f |= VF_DITHER;
+    if (s_mask_set) f |= VF_SET_MASK;
+    if (s_mask_check) f |= VF_CHECK_MASK;
+    return f;
+}
+
+static int rects_meet(int ax0, int ay0, int ax1, int ay1, int bx0, int by0, int bx1, int by1) {
+    return ax0 <= bx1 && bx0 <= ax1 && ay0 <= by1 && by0 <= ay1;
+}
+
+/* Native VRAM a textured primitive reads must include what earlier
+ * primitives drew there: pack first when the page or CLUT row meets it. */
+static void pack_if_sampling(int base_x, int base_y, int depth, int cx, int cy) {
+    if (!s_drawn) return;
+    const int width = depth == 0 ? 64 : depth == 1 ? 128 : 256;
+    const int x0 = s_drawn_x0, y0 = s_drawn_y0, x1 = s_drawn_x1, y1 = s_drawn_y1;
+    int hit = rects_meet(base_x, base_y, base_x + width - 1, base_y + 255, x0, y0, x1, y1);
+    if (base_x + width > VRAM_W)   /* the page wraps past column 1023 */
+        hit |= rects_meet(0, base_y, base_x + width - VRAM_W - 1, base_y + 255, x0, y0, x1, y1);
+    if (depth < 2) {
+        const int entries = depth == 0 ? 16 : 256;
+        hit |= rects_meet(cx, cy, cx + entries - 1, cy, x0, y0, x1, y1);
+        if (cx + entries > VRAM_W)
+            hit |= rects_meet(0, cy, cx + entries - VRAM_W - 1, cy, x0, y0, x1, y1);
+    }
+    if (hit) pack_drawn();
+}
+
+/* Draws n vertices (triangles, or one line when line != 0) clipped to the
+ * draw area. bx/by: the primitive's native bounding box. */
+static void draw(const MetalVtx *v, int n, int line, int bx0, int by0, int bx1, int by1) {
+    if (!s_ready || n <= 0) return;
+    int x0 = s_clip[0], y0 = s_clip[1], x1 = s_clip[2], y1 = s_clip[3];
+    if (x1 > VRAM_W - 1) x1 = VRAM_W - 1;
+    if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (bx0 > x0) x0 = bx0;
+    if (by0 > y0) y0 = by0;
+    if (bx1 < x1) x1 = bx1;
+    if (by1 < y1) y1 = by1;
+    if (x0 > x1 || y0 > y1) return;
+    const int S = s_scale;
+    id<MTLRenderCommandEncoder> e = render();
+    MTLScissorRect sc = {
+        (NSUInteger)(s_clip[0] < 0 ? 0 : s_clip[0]) * S,
+        (NSUInteger)(s_clip[1] < 0 ? 0 : s_clip[1]) * S, 0, 0
+    };
+    const int cw = (s_clip[2] > VRAM_W - 1 ? VRAM_W - 1 : s_clip[2]) - (int)(sc.x / S) + 1;
+    const int ch = (s_clip[3] > VRAM_H - 1 ? VRAM_H - 1 : s_clip[3]) - (int)(sc.y / S) + 1;
+    if (cw <= 0 || ch <= 0) return;
+    sc.width = (NSUInteger)cw * S;
+    sc.height = (NSUInteger)ch * S;
+    [e setScissorRect:sc];
+    MetalU u = {0.5f / (float)S - 1.0f / 64.0f, (uint32_t)S, (uint32_t)s_dither_mode, 0};
+    [e setVertexBytes:v length:(NSUInteger)n * sizeof *v atIndex:0];
+    [e setVertexBytes:&u length:sizeof u atIndex:1];
+    [e setFragmentBytes:&u length:sizeof u atIndex:1];
+    [e drawPrimitives:line ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle
+          vertexStart:0 vertexCount:(NSUInteger)n];
+    if (!s_drawn) {
+        s_drawn = 1;
+        s_drawn_x0 = x0; s_drawn_y0 = y0; s_drawn_x1 = x1; s_drawn_y1 = y1;
+    } else {
+        if (x0 < s_drawn_x0) s_drawn_x0 = x0;
+        if (y0 < s_drawn_y0) s_drawn_y0 = y0;
+        if (x1 > s_drawn_x1) s_drawn_x1 = x1;
+        if (y1 > s_drawn_y1) s_drawn_y1 = y1;
+    }
+    gpu_vram_dirty_mark_rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+}
+
+static void bounds(const int *xs, const int *ys, int n, int *b) {
+    b[0] = b[2] = xs[0];
+    b[1] = b[3] = ys[0];
+    for (int i = 1; i < n; ++i) {
+        if (xs[i] < b[0]) b[0] = xs[i];
+        if (xs[i] > b[2]) b[2] = xs[i];
+        if (ys[i] < b[1]) b[1] = ys[i];
+        if (ys[i] > b[3]) b[3] = ys[i];
+    }
+}
+
+static void color5(uint16_t c, float *out) {
+    out[0] = (float)((c & 0x1F) << 3) / 255.0f;
+    out[1] = (float)(((c >> 5) & 0x1F) << 3) / 255.0f;
+    out[2] = (float)(((c >> 10) & 0x1F) << 3) / 255.0f;
+    out[3] = 1.0f;
+}
+
+/* Flat or Gouraud geometry: triangles (n = 3) or a line (n = 2). */
+static void geometry(const int *xs, const int *ys, const uint16_t *cs, int n, int dither) {
+    MetalVtx v[6];
+    memset(v, 0, sizeof v);
+    const uint32_t f = prim_flags(semi_code(), dither);
+    int b[4];
+    bounds(xs, ys, n, b);
+    if (n == 3) {
+        for (int i = 0; i < 3; ++i) {
+            v[i].pos[0] = (float)xs[i];
+            v[i].pos[1] = (float)ys[i];
+            color5(cs[i], v[i].col);
+            v[i].flags = f;
+        }
+        draw(v, 3, 0, b[0], b[1], b[2], b[3]);
+        return;
+    }
+    if (s_scale == 1) {   /* native: a line, as OpenGL's GL_LINES */
+        for (int i = 0; i < 2; ++i) {
+            v[i].pos[0] = (float)xs[i];
+            v[i].pos[1] = (float)ys[i];
+            color5(cs[i], v[i].col);
+            v[i].flags = f;
+        }
+        draw(v, 2, 1, b[0], b[1], b[2], b[3]);
+        return;
+    }
+    /* A quad one native pixel thick (gpu_gl_renderer.c line_to_quad). */
+    const float x0 = (float)xs[0] + 0.5f, y0 = (float)ys[0] + 0.5f;
+    const float x1 = (float)xs[1] + 0.5f, y1 = (float)ys[1] + 0.5f;
+    const float dx = x1 - x0, dy = y1 - y0, ax = fabsf(dx), ay = fabsf(dy);
+    float ex, ey, nx, ny;
+    if (ax >= ay) {
+        const float sx = dx < 0.0f ? -1.0f : 1.0f;
+        ex = 0.5f * sx;
+        ey = ax > 0.0f ? 0.5f * sx * dy / dx : 0.0f;
+        nx = 0.0f;
+        ny = 0.5f;
+    } else {
+        const float sy = dy < 0.0f ? -1.0f : 1.0f;
+        ey = 0.5f * sy;
+        ex = 0.5f * sy * dx / dy;
+        nx = 0.5f;
+        ny = 0.0f;
+    }
+    const float a[2] = {x0 - ex, y0 - ey}, bb[2] = {x1 + ex, y1 + ey};
+    const float qx[6] = {a[0] - nx, bb[0] - nx, a[0] + nx, bb[0] - nx, a[0] + nx, bb[0] + nx};
+    const float qy[6] = {a[1] - ny, bb[1] - ny, a[1] + ny, bb[1] - ny, a[1] + ny, bb[1] + ny};
+    for (int i = 0; i < 6; ++i) {
+        v[i].pos[0] = qx[i];
+        v[i].pos[1] = qy[i];
+        color5(cs[i & 1], v[i].col);
+        v[i].flags = f;
+    }
+    draw(v, 6, 0, b[0], b[1], b[2], b[3]);
+}
+
+/* A textured triangle (gpu_gl_renderer.c gpu_textured_triangle, nearest
+ * sampling). col: three rgb modulation colours in 0..1; lim: uv bounds, or
+ * NULL to compute them with the centre-sampling compensation. */
+static void textured(const int *xs, const int *ys, const int *us_in, const int *vs_in,
+                     const float *col, uint16_t tp, uint16_t cx, uint16_t cy, int raw,
+                     int semi, int dither, const int *lim) {
+    int us[3] = {us_in[0], us_in[1], us_in[2]}, vs[3] = {vs_in[0], vs_in[1], vs_in[2]};
+    int lim_buf[4];
+    if (!lim) {
+        psx_uv_tri_center_sample(xs, ys, us, vs, 0, lim_buf);
+        lim = lim_buf;
+    }
+    const int base_x = (tp & 0xF) * 64, base_y = ((tp >> 4) & 1) * 256;
+    int depth = (tp >> 7) & 3;
+    if (depth > 2) depth = 2;
+    pack_if_sampling(base_x, base_y, depth, cx, cy);
+    uint32_t f = prim_flags(semi, dither && !raw) | VF_TEXTURED | ((uint32_t)depth << 2);
+    if (raw) f |= VF_RAW;
+    MetalVtx v[3];
+    memset(v, 0, sizeof v);
+    for (int i = 0; i < 3; ++i) {
+        v[i].pos[0] = (float)xs[i];
+        v[i].pos[1] = (float)ys[i];
+        v[i].uv[0] = (float)us[i];
+        v[i].uv[1] = (float)vs[i];
+        v[i].col[0] = col[i * 3];
+        v[i].col[1] = col[i * 3 + 1];
+        v[i].col[2] = col[i * 3 + 2];
+        v[i].col[3] = 1.0f;
+        v[i].flags = f;
+        v[i].page = (uint32_t)base_x | ((uint32_t)base_y << 16);
+        v[i].clut = (uint32_t)cx | ((uint32_t)cy << 16);
+        v[i].twin = s_twin;
+        for (int k = 0; k < 4; ++k) v[i].lim[k] = lim[k];
+    }
+    int b[4];
+    bounds(xs, ys, 3, b);
+    draw(v, 3, 0, b[0], b[1], b[2], b[3]);
+}
+
+static void modulation(float *col) {
+    for (int i = 0; i < 3; ++i) {
+        col[i * 3] = (float)s_mod_r / 255.0f;
+        col[i * 3 + 1] = (float)s_mod_g / 255.0f;
+        col[i * 3 + 2] = (float)s_mod_b / 255.0f;
+    }
+}
+
+static void textured_rect(int x, int y, int w, int h, int u0, int v0, int u1, int v1,
+                          uint16_t cx, uint16_t cy, uint16_t tp) {
+    if (w <= 0 || h <= 0) return;
+    float col[9];
+    modulation(col);
+    int lim[4];
+    psx_uv_rect_limits(u0, v0, u1, v1, lim);
+    psx_uv_rect_mirror_offset(&u0, &v0, &u1, &v1);
+    const int semi = semi_code();
+    const int xs1[3] = {x, x + w, x}, ys1[3] = {y, y, y + h};
+    const int us1[3] = {u0, u1, u0}, vs1[3] = {v0, v0, v1};
+    textured(xs1, ys1, us1, vs1, col, tp, cx, cy, s_mod_raw, semi, 0, lim);
+    const int xs2[3] = {x + w, x, x + w}, ys2[3] = {y, y + h, y + h};
+    const int us2[3] = {u1, u0, u1}, vs2[3] = {v0, v1, v1};
+    textured(xs2, ys2, us2, vs2, col, tp, cx, cy, s_mod_raw, semi, 0, lim);
+}
+
 static void mb_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
-    (void)x0; (void)y0; (void)x1; (void)y1; (void)x2; (void)y2; (void)c;
-    unimplemented("flat triangle drawing");
+    const int xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
+    const uint16_t cs[3] = {c, c, c};
+    geometry(xs, ys, cs, 3, 0);
 }
 static void mb_draw_gouraud_triangle(int x0, int y0, uint16_t c0, int x1, int y1, uint16_t c1,
                                      int x2, int y2, uint16_t c2) {
-    (void)x0; (void)y0; (void)c0; (void)x1; (void)y1; (void)c1; (void)x2; (void)y2; (void)c2;
-    unimplemented("Gouraud triangle drawing");
+    const int xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
+    const uint16_t cs[3] = {c0, c1, c2};
+    geometry(xs, ys, cs, 3, 1);
 }
 static void mb_draw_textured_triangle(int x0, int y0, int u0, int v0, int x1, int y1, int u1,
                                       int v1, int x2, int y2, int u2, int v2, uint16_t cx,
                                       uint16_t cy, uint16_t tp) {
-    (void)x0; (void)y0; (void)u0; (void)v0; (void)x1; (void)y1; (void)u1; (void)v1;
-    (void)x2; (void)y2; (void)u2; (void)v2; (void)cx; (void)cy; (void)tp;
-    unimplemented("textured triangle drawing");
+    const int xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
+    const int us[3] = {u0, u1, u2}, vs[3] = {v0, v1, v2};
+    float col[9];
+    modulation(col);
+    textured(xs, ys, us, vs, col, tp, cx, cy, s_mod_raw, semi_code(), 1, NULL);
 }
 static void mb_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0, uint32_t c0,
                                              int x1, int y1, int u1, int v1, uint32_t c1,
                                              int x2, int y2, int u2, int v2, uint32_t c2,
                                              uint16_t cx, uint16_t cy, uint16_t tp, int raw) {
-    (void)x0; (void)y0; (void)u0; (void)v0; (void)c0; (void)x1; (void)y1; (void)u1; (void)v1;
-    (void)c1; (void)x2; (void)y2; (void)u2; (void)v2; (void)c2; (void)cx; (void)cy; (void)tp;
-    (void)raw;
-    unimplemented("shaded textured triangle drawing");
+    const int xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
+    const int us[3] = {u0, u1, u2}, vs[3] = {v0, v1, v2};
+    const uint32_t cc[3] = {c0, c1, c2};
+    float col[9];
+    for (int i = 0; i < 3; ++i) {
+        col[i * 3] = (float)(cc[i] & 0xFF) / 255.0f;
+        col[i * 3 + 1] = (float)((cc[i] >> 8) & 0xFF) / 255.0f;
+        col[i * 3 + 2] = (float)((cc[i] >> 16) & 0xFF) / 255.0f;
+    }
+    textured(xs, ys, us, vs, col, tp, cx, cy, raw, semi_code(), 1, NULL);
 }
 static void mb_draw_flat_rect(int x, int y, int w, int h, uint16_t c) {
-    (void)x; (void)y; (void)w; (void)h; (void)c;
-    unimplemented("flat rectangle drawing");
+    if (w <= 0 || h <= 0) return;
+    const uint16_t cs[3] = {c, c, c};
+    const int xs1[3] = {x, x + w, x}, ys1[3] = {y, y, y + h};
+    geometry(xs1, ys1, cs, 3, 0);
+    const int xs2[3] = {x + w, x, x + w}, ys2[3] = {y, y + h, y + h};
+    geometry(xs2, ys2, cs, 3, 0);
 }
 static void mb_draw_textured_rect(int x, int y, int w, int h, int u, int v, uint16_t cx,
                                   uint16_t cy, uint16_t tp) {
-    (void)x; (void)y; (void)w; (void)h; (void)u; (void)v; (void)cx; (void)cy; (void)tp;
-    unimplemented("textured rectangle drawing");
+    textured_rect(x, y, w, h, u, v, u + w, v + h, cx, cy, tp);
 }
 static void mb_draw_textured_rect_scaled(int x, int y, int w, int h, int u0, int v0, int u1,
                                          int v1, uint16_t cx, uint16_t cy, uint16_t tp) {
-    (void)x; (void)y; (void)w; (void)h; (void)u0; (void)v0; (void)u1; (void)v1;
-    (void)cx; (void)cy; (void)tp;
-    unimplemented("scaled textured rectangle drawing");
+    textured_rect(x, y, w, h, u0, v0, u1, v1, cx, cy, tp);
 }
 static void mb_draw_line(int x0, int y0, int x1, int y1, uint16_t c) {
-    (void)x0; (void)y0; (void)x1; (void)y1; (void)c;
-    unimplemented("line drawing");
+    const int xs[2] = {x0, x1}, ys[2] = {y0, y1};
+    const uint16_t cs[2] = {c, c};
+    geometry(xs, ys, cs, 2, 0);
 }
 static void mb_draw_shaded_line(int x0, int y0, uint16_t c0, int x1, int y1, uint16_t c1) {
-    (void)x0; (void)y0; (void)c0; (void)x1; (void)y1; (void)c1;
-    unimplemented("shaded line drawing");
+    const int xs[2] = {x0, x1}, ys[2] = {y0, y1};
+    const uint16_t cs[2] = {c0, c1};
+    geometry(xs, ys, cs, 2, 1);
 }
 
 static int mb_render_display(uint32_t *out, int pitch, int dx, int dy, int dw, int dh) {
@@ -515,6 +960,7 @@ static const GpuRenderBackend k_metal = {
     .set_mask_bits = mb_set_mask_bits,
     .set_texture_window = mb_set_texture_window,
     .set_color_modulation = mb_set_color_modulation,
+    .set_dither = mb_set_dither,
     .fill_rect = mb_fill_rect,
     .copy_rect = mb_copy_rect,
     .draw_flat_triangle = mb_draw_flat_triangle,

@@ -1399,8 +1399,18 @@ static int           g_video_requested_scale = 1;
 static bool          g_video_scale_applies = true;
 static bool          g_video_hidpi_window = false;
 
+/* gpu_metal_renderer.m's ceiling: its surfaces are GPU textures, as OpenGL's. */
+#define METAL_MAX_INTERNAL_SCALE 16
+
 static int video_scale_ceiling(void) {
-    return g_video_renderer == 1 ? GL_MAX_INTERNAL_SCALE : SW_MAX_INTERNAL_SCALE;
+    return g_video_renderer == 1 ? GL_MAX_INTERNAL_SCALE :
+           g_video_renderer == 3 ? METAL_MAX_INTERNAL_SCALE : SW_MAX_INTERNAL_SCALE;
+}
+
+/* The CPU present path's staging scale: the Metal backend reads its
+ * surfaces back at internal resolution, as the software renderer does. */
+static int cpu_present_scale_max(void) {
+    return g_video_renderer == 3 ? METAL_MAX_INTERNAL_SCALE : SW_MAX_INTERNAL_SCALE;
 }
 
 /* Session priority: environment override, a title mod's request
@@ -10695,7 +10705,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* The software wide readback can exceed the canonical 640px staging
          * width, especially on high-resolution and resized adaptive frames. */
         const int staging_scale = std::max(1, std::min(
-            std::max(g_video_scale, gr_scale()), SW_MAX_INTERNAL_SCALE));
+            std::max(g_video_scale, gr_scale()), cpu_present_scale_max()));
         const size_t staging_pixels = (size_t)present_w * std::max(h, present_h) *
                                       (size_t)staging_scale * staging_scale;
         if (!ensure_sdl_pixel_buf_capacity(staging_pixels)) return ep;
@@ -19060,6 +19070,7 @@ int main(int argc, char** argv) {
             if      (std::strcmp(r, "software") == 0) cli_renderer = 0;
             else if (std::strcmp(r, "opengl")   == 0) cli_renderer = 1;
             else if (std::strcmp(r, "vulkan")   == 0) cli_renderer = 2;
+            else if (std::strcmp(r, "metal")    == 0) cli_renderer = 3;
         } else if (std::strcmp(argv[i], "--window-title") == 0 && i + 1 < argc) {
             cli_window_title = argv[++i];
         } else if (std::strcmp(argv[i], "--netplay-query") == 0 && i + 1 < argc) {
@@ -21976,6 +21987,13 @@ session_reboot:
         g_video_renderer = 1;
     }
 #endif
+#ifndef PSX_METAL_RENDERER
+    if (g_video_renderer == 3) {
+        std::fprintf(stdout, "psxrecomp: Metal renderer is not available in this build "
+                             "(PSX_METAL_RENDERER off); using software instead.\n");
+        g_video_renderer = 0;
+    }
+#endif
     /* Netplay: CPU VRAM is digest/snap authority. Prefer dual-raster OpenGL
      * (SW@1× + GL@settings SSAA FBO present, never glReadPixels). Vulkan
      * present not yet cpu-auth — fall back to a software window. */
@@ -21995,10 +22013,11 @@ session_reboot:
             std::fprintf(stdout,
                          "psxrecomp: renderer backend requested: opengl "
                          "(netplay dual-raster)\n");
-        } else if (g_video_renderer == 2) {
+        } else if (g_video_renderer == 2 || g_video_renderer == 3) {
             std::fprintf(stdout,
-                         "psxrecomp: netplay — Vulkan present not yet CPU-auth; "
-                         "using software window (was vulkan)\n");
+                         "psxrecomp: netplay — %s present not yet CPU-auth; "
+                         "using software window\n",
+                         g_video_renderer == 2 ? "Vulkan" : "Metal");
             g_video_renderer = 0;
             gr_set_backend(GR_BACKEND_SOFTWARE);
             std::fprintf(stdout,
@@ -22017,10 +22036,14 @@ session_reboot:
          * Ordinary headless has no context and uses software. The explicit
          * hidden-OpenGL mode creates a context below and refuses fallback. */
         const int backend_renderer = g_headless && !g_headless_opengl ? 0 : g_video_renderer;
-        gr_set_backend(backend_renderer == 2 ? GR_BACKEND_VULKAN :
+        gr_set_backend(backend_renderer == 3 ? GR_BACKEND_METAL :
+                       backend_renderer == 2 ? GR_BACKEND_VULKAN :
                        backend_renderer == 1 ? GR_BACKEND_OPENGL :
                                                GR_BACKEND_SOFTWARE);
+        if (backend_renderer == 3 && gr_backend() != GR_BACKEND_METAL)
+            g_video_renderer = 0;   /* no Metal device: the software window */
         std::fprintf(stdout, "psxrecomp: renderer backend requested: %s%s\n",
+                     backend_renderer == 3 ? "metal" :
                      backend_renderer == 2 ? "vulkan" :
                      backend_renderer == 1 ? "opengl" : "software",
                      g_headless_opengl ? " (hidden context)" :
@@ -22078,11 +22101,11 @@ session_reboot:
          * and clamps there to the driver's texture limits and a memory budget
          * (gl_scale_limits.h), so only its compile-time bound applies here.
          * Software keeps a CPU mirror of 1 MiB*S^2 and Vulkan accepts 1..4. */
-        const int ceiling = (g_video_renderer == 1) ? GL_MAX_INTERNAL_SCALE
-                                                    : SW_MAX_INTERNAL_SCALE;
+        const int ceiling = video_scale_ceiling();
         if (g_video_scale > ceiling) {
             std::fprintf(stdout, "psxrecomp: supersampling %dx clamped to %dx "
                          "(%s maximum)\n", g_video_scale, ceiling,
+                         g_video_renderer == 3 ? "metal" :
                          g_video_renderer == 2 ? "vulkan" : "software");
             g_video_scale = ceiling;
         }
@@ -22962,7 +22985,7 @@ session_reboot:
          * (<= SW_MAX_INTERNAL_SCALE); under OpenGL it is native (see
          * active_scale), so an 8K GL scale never sizes this buffer by S^2. */
         int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
-        if (tex_scale > SW_MAX_INTERNAL_SCALE) tex_scale = SW_MAX_INTERNAL_SCALE;
+        if (tex_scale > cpu_present_scale_max()) tex_scale = cpu_present_scale_max();
         if (!ensure_sdl_pixel_buf_capacity(
                 (size_t)640 * tex_scale * PSX_DISPLAY_PRESENT_MAX_HEIGHT *
                 tex_scale)) {

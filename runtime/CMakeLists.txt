@@ -2848,6 +2848,14 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
         add_test(NAME metal_renderer_vram_test COMMAND metal_renderer_vram_test)
         set_tests_properties(metal_renderer_vram_test PROPERTIES SKIP_RETURN_CODE 77)
 
+        # Metal surface backend parity: replays a renderer recording and
+        # captures every displayed frame for comparison with the OpenGL
+        # replay (test_gpu_parity_replay.c). A manual tool; no test registered.
+        add_executable(metal_parity_replay tests/test_metal_parity_replay.c
+            src/gpu_sw_renderer.c)
+        target_include_directories(metal_parity_replay PRIVATE include src)
+        psxrecomp_enable_metal_rasterizer(metal_parity_replay)
+
         # Replays renderer recordings through the CPU and Metal rasterizers.
         add_executable(gr_replay tests/replay_gr_recording.c src/gpu_sw_renderer.c)
         target_include_directories(gr_replay PRIVATE include)

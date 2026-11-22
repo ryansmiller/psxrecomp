@@ -20,6 +20,12 @@ void gpu_vram_dirty_mark_rect(int x, int y, int w, int h) {
     (void)x; (void)y; (void)w; (void)h;
 }
 void gpu_vram_dirty_mark_all(void) {}
+/* gpu_metal_renderer.m links into every Metal target; this test never
+ * selects that backend, so a halt there is a failure. */
+void psx_fatal_halt(const char *reason) {
+    fprintf(stderr, "FAIL fatal halt: %s\n", reason);
+    exit(1);
+}
 
 static uint16_t vram[width * height], expected[width * height];
 static uint32_t display[view_width * view_height * 16];
