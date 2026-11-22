@@ -42,10 +42,10 @@ int main() {
     std::memcpy(header.magic,"FMVHD003",8);
     header.frames=header.sig_w=header.sig_h=header.sub=header.fps_den=1;
     header.fps_num=30;header.src_w=header.src_h=header.disp_w=header.disp_h=2;
-    auto index=[&](FmvHdIndexHeader h) {
+    auto index=[&](FmvHdIndexHeader h, unsigned char second_signature=0) {
         std::ofstream out(root/"movie/index.bin",std::ios::binary);
         out.write(reinterpret_cast<const char*>(&h),sizeof h);out.put(0);
-        if(h.frames==2)out.put(0); /* deliberately identical source signatures */
+        if(h.frames==2)out.put(second_signature);
         const int32_t lba=0;out.write(reinterpret_cast<const char*>(&lba),sizeof lba);
         if(h.frames==2){const int32_t next=10;out.write(reinterpret_cast<const char*>(&next),sizeof next);}
     };
@@ -127,7 +127,9 @@ int main() {
     timeline.epoch++;timeline.cycle=1000;
     check(lookup() && output.rgba[0]==0,"rollback epoch restarts subframe");
     original[0]=0xffffffffu;
-    check(!lookup(),"unrecognised movie scanout falls back to native image");
+    check(lookup() && output.rgba[0]==0,"brief signature loss holds the last HD frame");
+    timeline.cycle+=33868800/8+1;
+    check(!lookup(),"persistent unrecognised scanout falls back to native image");
     gpu_fmv_hd_shutdown();
     original[0]=0xff000000u;
     /* A SetLoc target identifies the stream, while its delivered frame
@@ -145,6 +147,22 @@ int main() {
     check(lookup() && output.rgba[0]==0,"CD seek generation restarts the same movie frame");
     gpu_fmv_hd_reset_tracking();
     check(lookup() && output.rgba[0]==0,"movie end/skip clears held frame identity");
+    gpu_fmv_hd_shutdown();
+
+    index(two, 64);
+    timeline={1000,1,5,3,0,0,1};
+    mapped_first=false;
+    for(int i=0;i<200 && !mapped_first;++i){mapped_first=lookup() && output.rgba[0]==0;if(!mapped_first)SDL_Delay(2);}
+    check(mapped_first,"matching sector establishes the movie");
+    for(auto &pixel:original)pixel=0xff404040u;
+    timeline.cycle+=1000;timeline.frame++;timeline.decode_serial++;
+    mapped_second=false;
+    for(int i=0;i<200 && !mapped_second;++i){mapped_second=lookup() && output.rgba[0]==255;if(!mapped_second)SDL_Delay(2);}
+    check(mapped_second,"signature recovers a neighbouring frame when CD delivery lags");
+    for(auto &pixel:original)pixel=0xffffffffu;
+    check(lookup() && output.rgba[0]==255,"transient signature miss holds the recovered HD frame");
+    timeline.stream_generation++;
+    check(!lookup(),"CD seek immediately invalidates a held frame");
     gpu_fmv_hd_shutdown();
     fs::remove_all(root);
     if(!failures)std::cout<<"PASS FMV bounds, lifecycle and guest timeline\n";

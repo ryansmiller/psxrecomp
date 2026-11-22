@@ -38,6 +38,8 @@ extern SDL_Thread *fmv_hd_test_start_thread(SDL_ThreadFunction, void *);
 #define FMV_ACCEPT_LOCAL 14     /* mean difference accepted near the last frame */
 #define FMV_ACCEPT_GLOBAL 9     /* mean difference accepted in a global search */
 #define FMV_NEAR_GLOBAL  27     /* difference under which a vertical re-alignment is tried */
+#define FMV_SECTOR_SLOP   2     /* nearby frames when CD read-ahead varies during playback */
+#define FMV_HOLD_CYCLES  (FMV_GUEST_HZ / 8)
 
 typedef struct Movie {
     char dir[1024];
@@ -78,6 +80,7 @@ static size_t s_shown_cap = 0;
 static int s_shown_w = 0, s_shown_h = 0;
 static int s_shown_movie = -1, s_shown_frame = -1;
 static uint64_t s_shown_serial = 0;
+static uint64_t s_shown_cycle = 0, s_held_frames = 0;
 
 static void reset_tracking(void) {
     s_cur_movie = s_cur_src = s_shown_movie = s_shown_frame = -1;
@@ -312,6 +315,7 @@ void gpu_fmv_hd_shutdown(void) {
     s_shown_w = s_shown_h = s_nmovies = s_init = s_stopping = 0;
     s_cur_movie = s_cur_src = s_shown_movie = s_shown_frame = -1;
     s_cur_since = s_shown_serial = s_clock = 0;
+    s_shown_cycle = s_held_frames = 0;
     s_have_timeline = 0;
     memset(&s_last_timeline, 0, sizeof s_last_timeline);
 }
@@ -342,6 +346,16 @@ static unsigned distance(const uint8_t *a, const uint8_t *b, size_t n) {
     return (unsigned)(d / n);
 }
 
+static int sector_frame(const Movie *mv, int32_t lba) {
+    int lo = 0, hi = (int)mv->h.frames;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (mv->frame_lbas[mid] <= lba) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo - 1;
+}
+
 static Slot *slot_for(int movie, int frame, int request) {
     for (int i = 0; i < FMV_RING; ++i)
         if (s_ring[i].movie == movie && s_ring[i].frame == frame) { s_ring[i].used = ++s_clock; return &s_ring[i]; }
@@ -363,6 +377,23 @@ static Slot *slot_for(int movie, int frame, int request) {
 static unsigned s_dbg_best = ~0u;
 static int s_dbg_src_w, s_dbg_src_h, s_dbg_frame = -1;
 
+static int present_shown(FmvHdImage *out) {
+    out->rgba = s_shown; out->w = s_shown_w; out->h = s_shown_h;
+    out->serial = s_shown_serial;
+    ++s_hd_frames;
+    return 1;
+}
+
+static int hold_shown(uint64_t cycle, FmvHdImage *out) {
+    /* Keep a briefly late/mismatched frame in HD within a confirmed CD stream.
+     * Resets clear its identity, so it cannot bleed into another stream. */
+    if (s_cur_movie < 0 || s_cur_movie != s_shown_movie ||
+        !s_movies[s_cur_movie].bound_stream || cycle - s_shown_cycle > FMV_HOLD_CYCLES)
+        return 0;
+    ++s_held_frames;
+    return present_shown(out);
+}
+
 int gpu_fmv_hd_lookup(const uint32_t *bgra, int src_w, int src_h, int content_w,
                       FmvHdTimeline timeline, FmvHdImage *out) {
     init_once();
@@ -372,6 +403,7 @@ int gpu_fmv_hd_lookup(const uint32_t *bgra, int src_w, int src_h, int content_w,
         timeline.decode_serial != s_last_timeline.decode_serial;
     if (s_have_timeline && (timeline.epoch != s_last_timeline.epoch ||
         timeline.stream_generation != s_last_timeline.stream_generation ||
+        timeline.stream_lba != s_last_timeline.stream_lba ||
         timeline.cycle < s_last_timeline.cycle || timeline.frame < s_last_timeline.frame))
         reset_tracking();
     s_last_timeline = timeline;
@@ -380,13 +412,13 @@ int gpu_fmv_hd_lookup(const uint32_t *bgra, int src_w, int src_h, int content_w,
     s_dbg_src_w = src_w; s_dbg_src_h = src_h; s_dbg_best = ~0u;
     const int cw = (content_w > 0 && content_w < src_w) ? content_w : src_w;
 
-    /* Local search, then global. In a global search a nearly recognised movie is also tried
-     * shifted by a few lines (each movie has its own position on screen); the offset found
-     * is kept for the frames that follow. */
+    /* Prefer the current movie and sector interval, then try reacquiring it.
+     * A confirmed stream can also verify nearby frames when read-ahead varies.
+     * A wider search can refine the vertical offset used for following frames. */
     static const int k_dys[] = { 0, -8, 8, -16, 16, -4, 4 };
     int best_m = -1, best_f = -1; unsigned best_d = ~0u;
     uint8_t sig[64 * 64];
-    for (int pass = 0; pass < 2 && best_m < 0; ++pass) {
+    for (int pass = 0; pass < 3 && best_m < 0; ++pass) {
         for (int m = 0; m < s_nmovies; ++m) {
             Movie *mv = &s_movies[m];
             if (mv->bound_stream &&
@@ -395,11 +427,21 @@ int gpu_fmv_hd_lookup(const uint32_t *bgra, int src_w, int src_h, int content_w,
             const size_t n = (size_t)mv->h.sig_w * mv->h.sig_h;
             if (n > sizeof sig) continue;
             int lo = 0, hi = (int)mv->h.frames - 1;
+            if (pass == 2 && (!mv->bound_stream || m != s_cur_movie)) continue;
             if (pass == 0) {
                 if (m != s_cur_movie || s_cur_src < 0) continue;
                 lo = s_cur_src - FMV_LOCAL_BACK; hi = s_cur_src + FMV_LOCAL_AHEAD;
                 if (lo < 0) lo = 0;
                 if (hi > (int)mv->h.frames - 1) hi = (int)mv->h.frames - 1;
+            }
+            if (mv->bound_stream) {
+                const int f = sector_frame(mv, timeline.delivered_lba);
+                if (f < 0) continue;
+                const int slop = pass == 2 ? FMV_SECTOR_SLOP : 0;
+                if (lo < f - slop) lo = f - slop;
+                if (hi > f + slop) hi = f + slop;
+                if (m == s_cur_movie && lo < s_cur_src) lo = s_cur_src;
+                if (lo > hi) continue;
             }
             const int ntry = pass == 0 ? 1 : (int)(sizeof k_dys / sizeof k_dys[0]);
             unsigned m_d = ~0u; int m_f = -1, m_dy = mv->dy;
@@ -421,9 +463,6 @@ int gpu_fmv_hd_lookup(const uint32_t *bgra, int src_w, int src_h, int content_w,
                 if (y0 + fh > src_h || y0 < 0) continue;
                 signature(bgra, src_w, x0, y0, fw, fh, (int)mv->h.sig_w, (int)mv->h.sig_h, sig);
                 for (int f = lo; f <= hi; ++f) {
-                    if (mv->bound_stream && (timeline.delivered_lba < mv->frame_lbas[f] ||
-                        (f + 1 < (int)mv->h.frames && timeline.delivered_lba >= mv->frame_lbas[f + 1])))
-                        continue;
                     const unsigned d = distance(sig, mv->sigs + (size_t)f * n, n);
                     if (d < m_d) { m_d = d; m_f = f; m_dy = dy; }
                 }
@@ -434,12 +473,16 @@ int gpu_fmv_hd_lookup(const uint32_t *bgra, int src_w, int src_h, int content_w,
             }
         }
     }
-    if (best_m < 0) { ++s_misses; reset_tracking(); return 0; }
+    if (best_m < 0) {
+        ++s_misses;
+        if (hold_shown(timeline.cycle, out)) return 1;
+        reset_tracking();
+        return 0;
+    }
 
     const uint64_t now = timeline.cycle;
     if (best_m != s_cur_movie || best_f != s_cur_src || new_decode) {
         s_cur_movie = best_m; s_cur_src = best_f; s_cur_since = now;
-        s_shown_movie = s_shown_frame = -1;
     }
     const Movie *mv = &s_movies[best_m];
     int k = 0;
@@ -456,7 +499,7 @@ int gpu_fmv_hd_lookup(const uint32_t *bgra, int src_w, int src_h, int content_w,
     /* Request the next frames ahead. */
     for (int a = 0; a < FMV_RING - 4 && hd + a <= last; ++a) slot_for(best_m, hd + a, 1);
     Slot *s = slot_for(best_m, hd, 0);
-    /* Exact frame not ready yet: the previous decoded one, else the original. */
+    /* Prefer a recent decoded frame while the requested one is pending. */
     for (int back = 0; (!s || s->state != 2) && back < (int)mv->h.sub * 2 && hd - back > 0; ++back)
         s = slot_for(best_m, hd - back - 1, 0);
     int ok = 0;
@@ -468,7 +511,7 @@ int gpu_fmv_hd_lookup(const uint32_t *bgra, int src_w, int src_h, int content_w,
             if (need > s_shown_cap) {
                 uint8_t *next = (uint8_t *)realloc(s_shown, need);
                 if (next) { s_shown = next; s_shown_cap = need; }
-                else { SDL_UnlockMutex(s_mutex); return 0; }
+                else { SDL_UnlockMutex(s_mutex); return hold_shown(now, out); }
             }
             if (s_shown) {
                 memcpy(s_shown, s->rgba, need);
@@ -477,13 +520,11 @@ int gpu_fmv_hd_lookup(const uint32_t *bgra, int src_w, int src_h, int content_w,
                 ok = 1;
             }
         }
-        if (ok) {
-            out->rgba = s_shown; out->w = s_shown_w; out->h = s_shown_h; out->serial = s_shown_serial;
-        }
     }
     SDL_UnlockMutex(s_mutex);
-    if (ok) { ++s_hd_frames; return 1; }
-    return 0;
+    if (!ok) return hold_shown(now, out);
+    s_shown_cycle = now;
+    return present_shown(out);
 }
 
 void gpu_fmv_hd_stats(uint64_t *hd_frames, uint64_t *queries, uint64_t *misses) {
@@ -495,12 +536,13 @@ void gpu_fmv_hd_stats(uint64_t *hd_frames, uint64_t *queries, uint64_t *misses) 
 int gpu_fmv_hd_debug_json(char *out, size_t cap) {
     return snprintf(out, cap,
         "\"init\":%d,\"enabled\":%d,\"movies\":%d,\"queries\":%llu,\"hd_frames\":%llu,"
-        "\"misses\":%llu,\"last_src\":[%d,%d],\"last_best_dist\":%u,\"last_best_frame\":%d,"
+        "\"misses\":%llu,\"held_frames\":%llu,\"last_src\":[%d,%d],\"last_best_dist\":%u,\"last_best_frame\":%d,"
         "\"cur_src\":%d,\"dy\":%d,\"guest_cycle\":%llu,\"epoch\":%llu,"
         "\"stream_generation\":%llu,\"stream_lba\":%d,\"delivered_lba\":%d,"
         "\"decode_serial\":%u",
         s_init, s_enabled, s_nmovies, (unsigned long long)s_queries, (unsigned long long)s_hd_frames,
-        (unsigned long long)s_misses, s_dbg_src_w, s_dbg_src_h, s_dbg_best, s_dbg_frame, s_cur_src,
+        (unsigned long long)s_misses, (unsigned long long)s_held_frames,
+        s_dbg_src_w, s_dbg_src_h, s_dbg_best, s_dbg_frame, s_cur_src,
         s_cur_movie >= 0 ? s_movies[s_cur_movie].dy : 0,
         (unsigned long long)s_last_timeline.cycle,
         (unsigned long long)s_last_timeline.epoch,
