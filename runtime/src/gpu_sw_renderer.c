@@ -40,6 +40,10 @@ static int g_metal_rasterizer;
 /* PSX_METAL_BATCH_CPU=1 applies batches with the CPU executor instead of
  * Metal, so tests can check the fallback against the reference. */
 static int g_metal_batch_cpu;
+/* Batches covering fewer pixels than this run on the CPU executor: a GPU
+ * round trip costs more than drawing them. PSX_METAL_BATCH_MIN_PIXELS
+ * overrides it; 0 sends every batch to Metal. */
+static uint32_t g_metal_batch_min_pixels = 32768;
 /* Applies queued Metal primitives before VRAM is read or otherwise written. */
 #define METAL_BATCH_SYNC() sw_metal_batch_sync()
 #else
@@ -622,6 +626,8 @@ void sw_renderer_init(uint16_t *vram) {
     g_metal_rasterizer = metal && strcmp(metal, "1") == 0;
     const char *cpu = getenv("PSX_METAL_BATCH_CPU");
     g_metal_batch_cpu = cpu && strcmp(cpu, "1") == 0;
+    const char *min_pixels = getenv("PSX_METAL_BATCH_MIN_PIXELS");
+    if (min_pixels) g_metal_batch_min_pixels = (uint32_t)strtoul(min_pixels, NULL, 10);
 #endif
     g_clip_x1 = 0;
     g_clip_y1 = 0;
@@ -1122,7 +1128,10 @@ void sw_metal_batch_sync(void) {
         }
         unsigned char dirty[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
         memset(dirty, 0, (size_t)b->h);
-        if (g_metal_batch_cpu ||
+        uint64_t pixels = 0;
+        for (uint32_t k = 0; k < b->entry_count && pixels < g_metal_batch_min_pixels; ++k)
+            pixels += b->entries[k].width;
+        if (g_metal_batch_cpu || pixels < g_metal_batch_min_pixels ||
             !psx_metal_draw_batch(b->buf, b->w, b->h, textured ? g_vram : NULL,
                                   b->primitives, b->primitive_count,
                                   b->entries, b->entry_count,

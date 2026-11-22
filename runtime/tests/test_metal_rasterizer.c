@@ -29,6 +29,7 @@ static uint32_t reference[view_width * view_height * 16];
  * pixels the earlier primitives wrote, so it must apply the queue first. */
 static void draw(int metal, int batch, int scale, int blend, int check, int set) {
     assert(setenv("PSX_METAL_RASTERIZER", metal ? "1" : "0", 1) == 0);
+    assert(setenv("PSX_METAL_BATCH_MIN_PIXELS", "0", 1) == 0);
     sw_renderer_init(vram);
     sw_renderer_set_scale(1);
     memset(vram, 0, sizeof(vram));

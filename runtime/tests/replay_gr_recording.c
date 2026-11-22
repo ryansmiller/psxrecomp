@@ -131,6 +131,8 @@ static int run(const char *name, const uint8_t *data, size_t size, int metal,
         return 0;
     }
     setenv("PSX_METAL_RASTERIZER", metal ? "1" : "0", 1);
+    /* Compare every batch on Metal unless the caller sets a cutoff. */
+    setenv("PSX_METAL_BATCH_MIN_PIXELS", "0", 0);
     sw_renderer_init(g_vram);
     if (!sw_state_load(r.p, state_size)) {
         fprintf(stderr, "%s: opening snapshot does not load\n", name);
