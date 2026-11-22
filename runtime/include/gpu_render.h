@@ -20,7 +20,8 @@ extern "C" {
 typedef enum {
     GR_BACKEND_SOFTWARE = 0,
     GR_BACKEND_OPENGL   = 1,
-    GR_BACKEND_VULKAN   = 2
+    GR_BACKEND_VULKAN   = 2,
+    GR_BACKEND_METAL    = 3   /* macOS, gpu_metal_renderer.m */
 } GrBackend;
 
 void      gr_set_backend(GrBackend backend);  /* call before gr_init() */

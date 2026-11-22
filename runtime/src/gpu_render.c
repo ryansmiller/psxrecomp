@@ -67,6 +67,11 @@ extern const GpuRenderBackend *gl_backend_get(void);
 /* Supplied by gpu_vk_renderer.c; returns NULL until the Vulkan backend is
  * ready (init succeeded). When Vulkan isn't compiled in it returns NULL. */
 extern const GpuRenderBackend *vk_backend_get(void);
+#ifdef PSX_METAL_RENDERER
+#include "gpu_metal_renderer.h"
+#else
+static const GpuRenderBackend *metal_backend_get(void) { return NULL; }
+#endif
 
 static const GpuRenderBackend *g_b         = &SW_BACKEND;
 static GrBackend               g_effective = GR_BACKEND_SOFTWARE;
@@ -150,6 +155,16 @@ void gr_set_backend(GrBackend backend) {
             return;
         }
         fprintf(stdout, "psxrecomp: renderer = vulkan requested but unavailable "
+                        "— falling back to software\n");
+    } else if (backend == GR_BACKEND_METAL) {
+        const GpuRenderBackend *metal = metal_backend_get();
+        if (metal) {
+            g_b = metal;
+            g_effective = GR_BACKEND_METAL;
+            fprintf(stdout, "psxrecomp: renderer = metal (%s)\n", metal->name);
+            return;
+        }
+        fprintf(stdout, "psxrecomp: renderer = metal requested but unavailable "
                         "— falling back to software\n");
     }
     g_b = &SW_BACKEND;

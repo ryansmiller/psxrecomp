@@ -2839,6 +2839,15 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
             $<$<COMPILE_LANGUAGE:C>:-ffp-contract=off>)
         add_test(NAME metal_rasterizer_test COMMAND metal_rasterizer_test)
 
+        # Metal surface backend: fills, copies, transfers and readbacks match
+        # the software renderer exactly at 1x, 2x and 4x.
+        add_executable(metal_renderer_vram_test tests/test_metal_renderer_vram.c
+            src/gpu_sw_renderer.c)
+        target_include_directories(metal_renderer_vram_test PRIVATE include)
+        psxrecomp_enable_metal_rasterizer(metal_renderer_vram_test)
+        add_test(NAME metal_renderer_vram_test COMMAND metal_renderer_vram_test)
+        set_tests_properties(metal_renderer_vram_test PROPERTIES SKIP_RETURN_CODE 77)
+
         # Replays renderer recordings through the CPU and Metal rasterizers.
         add_executable(gr_replay tests/replay_gr_recording.c src/gpu_sw_renderer.c)
         target_include_directories(gr_replay PRIVATE include)
