@@ -227,6 +227,9 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <SDL3/SDL_main.h>
 #endif
 #include "psx_sdl_audio.h"
+#ifdef PSX_METAL_RENDERER
+#include "gpu_metal_renderer.h"
+#endif
 #if defined(PSX_WEB)
 #include <emscripten/emscripten.h>
 #endif
@@ -535,6 +538,9 @@ static void apply_offline_pad_count(int game_players, bool multitap_enabled)
 static uint32_t*     sdl_pixel_buf = nullptr;
 static size_t        sdl_pixel_buf_capacity = 0;
 static int           sdl_texture_width = 0;
+/* --renderer metal: sdl_texture wraps the backend's IOSurface, which the GPU
+ * writes each frame (metal_renderer_present_direct). No frame upload. */
+static bool          sdl_texture_direct = false;
 static int           sdl_texture_height = 0;
 
 typedef void (*ModFrameHook)(void);
@@ -2581,8 +2587,32 @@ static int ensure_sdl_present_texture(int min_width, int min_height) {
         min_height <= sdl_texture_height) return 0;
     const int width = std::max(min_width, sdl_texture_width);
     const int height = std::max(min_height, sdl_texture_height);
-    SDL_Texture* next = SDL_CreateTexture(sdl_renderer,
-        SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width, height);
+    SDL_Texture* next = nullptr;
+    bool direct = false;
+#ifdef PSX_METAL_RENDERER
+    if (gr_backend() == GR_BACKEND_METAL && !netplay_cpu_auth_gpu()) {
+        void *pb = metal_renderer_present_pixel_buffer(width, height);
+        if (pb) {
+            SDL_PropertiesID props = SDL_CreateProperties();
+            SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER,
+                                  SDL_PIXELFORMAT_ARGB8888);
+            SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER,
+                                  SDL_TEXTUREACCESS_STREAMING);
+            SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, width);
+            SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, height);
+            SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_PIXELBUFFER_POINTER, pb);
+            next = SDL_CreateTextureWithProperties(sdl_renderer, props);
+            SDL_DestroyProperties(props);
+            direct = next != nullptr;
+            if (!direct)
+                std::fprintf(stdout, "psxrecomp: Metal direct present unavailable (%s); "
+                                     "frames are read back\n", SDL_GetError());
+        }
+    }
+#endif
+    if (!next)
+        next = SDL_CreateTexture(sdl_renderer,
+            SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width, height);
     if (!next) {
         std::fprintf(stderr, "psxrecomp: SDL_CreateTexture %dx%d failed: %s\n",
                      width, height, SDL_GetError());
@@ -2594,6 +2624,7 @@ static int ensure_sdl_present_texture(int min_width, int min_height) {
     sdl_texture = next;
     sdl_texture_width = width;
     sdl_texture_height = height;
+    sdl_texture_direct = direct;
     return 0;
 }
 
@@ -10619,6 +10650,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     bool depth24_frame = false;
     bool local_viewport_crop_applied = false;
     bool game_view_applied = false;
+    bool direct_present = false;   /* the GPU wrote sdl_texture itself */
     uint32_t gv_x = 0, gv_y = 0, gv_w = 0, gv_h = 0;
     if (s_force_present_after_load && g_gl_active)
         hw_renderer()->flush_cpu_uploads();
@@ -10887,6 +10919,14 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             scanout_timing.tag = (uint64_t)active_scale;
             /* Never hires-present under netplay CPU-auth (even if settings say
              * 4× — that preference is offline-only). */
+#ifdef PSX_METAL_RENDERER
+            if (active_scale > 1 && sdl_texture_direct && !game_view && !g_gl_active &&
+                !netplay_cpu_auth_gpu() &&
+                metal_renderer_present_direct((int)di.display_x, (int)di.display_y,
+                                              (int)present_w, (int)h, 1))
+                direct_present = true;
+            else
+#endif
             if (active_scale > 1 && !netplay_cpu_auth_gpu()) {
                 int sw = (int)present_w * active_scale;
                 gr_render_display_hires(sdl_pixel_buf, (int)(sw * sizeof(uint32_t)),
@@ -10908,7 +10948,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 
         int present_px_w = (int)present_w * active_scale;
         int present_px_h = (int)present_h * active_scale;
-        if (game_view && !wide_present) {
+        if (direct_present) {
+            /* The image is already in sdl_texture; nothing to crop. */
+        } else if (game_view && !wide_present) {
             crop_present_to_game_local_view(sdl_pixel_buf, present_px_w,
                                             active_scale, gv_x, gv_y,
                                             gv_w, gv_h);
@@ -10974,12 +11016,17 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     /* Spans the SDL upload, composition and swap through function exit. */
     PSX_METAL_TIMING_SCOPE(sdl_timing, "present-sdl");
     sdl_timing.tag = (uint64_t)src_w * (uint64_t)src_h;
-    SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
-                      (int)(src_w * sizeof(uint32_t)));
+    /* Direct present: the GPU already wrote the image (and its pad row) into
+     * sdl_texture, and the CPU never holds the frame, so the presented-image
+     * ring has nothing to sample. present_shot still reads the window. */
+    if (!direct_present)
+        SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
+                          (int)(src_w * sizeof(uint32_t)));
 #ifndef PSX_NO_DEBUG_TOOLS
     /* Presented-image ring (software/CPU present): the frame being shown. */
-    present_image_ring_push_argb((uint32_t)s_frame_count, sdl_pixel_buf,
-                                 (int)src_w, (int)src_h, (int)src_w);
+    if (!direct_present)
+        present_image_ring_push_argb((uint32_t)s_frame_count, sdl_pixel_buf,
+                                     (int)src_w, (int)src_h, (int)src_w);
 #endif
     {
         GpuDisplayInfo tdi;
@@ -10993,7 +11040,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * so any residual linear fringe is black, matching the letterbox. */
     const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
     const int tex_h = (int)PSX_DISPLAY_PRESENT_MAX_HEIGHT * tex_scale;
-    if (src_w > 0 && src_h > 0 && src_h < tex_h) {
+    if (!direct_present && src_w > 0 && src_h > 0 && src_h < tex_h) {
         static std::vector<uint32_t> black_pad;
         black_pad.assign((size_t)src_w, 0xFF000000u);
         SDL_Rect pad = { 0, src_h, src_w, 1 };

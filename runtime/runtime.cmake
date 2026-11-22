@@ -17,13 +17,17 @@ function(psxrecomp_enable_metal_rasterizer target)
     if(PSX_MACOS_METAL_RASTERIZER AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         find_library(_psx_metal_framework Metal REQUIRED)
         find_library(_psx_foundation_framework Foundation REQUIRED)
+        # Direct present wraps an IOSurface-backed CVPixelBuffer.
+        find_library(_psx_corevideo_framework CoreVideo REQUIRED)
+        find_library(_psx_iosurface_framework IOSurface REQUIRED)
         target_sources(${target} PRIVATE "${PSXRECOMP_ROOT}/runtime/src/gpu_metal_rasterizer.m"
                                          "${PSXRECOMP_ROOT}/runtime/src/gpu_metal_renderer.m")
         target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>")
         set_property(TARGET ${target} PROPERTY OBJC_STANDARD 11)
         target_compile_definitions(${target} PRIVATE PSX_MACOS_METAL_RASTERIZER=1
                                                      PSX_METAL_RENDERER=1)
-        target_link_libraries(${target} PRIVATE "${_psx_metal_framework}" "${_psx_foundation_framework}")
+        target_link_libraries(${target} PRIVATE "${_psx_metal_framework}" "${_psx_foundation_framework}"
+                                                "${_psx_corevideo_framework}" "${_psx_iosurface_framework}")
     endif()
 endfunction()
 

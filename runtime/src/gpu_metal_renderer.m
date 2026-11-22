@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#import <CoreVideo/CoreVideo.h>
 #include <string.h>
 
 enum { VRAM_W = 1024, VRAM_H = 512, MAX_SCALE = 16, STAGING_BYTES = 8u << 20 };
@@ -132,6 +133,25 @@ static NSString *const k_source =
     "    r = (r << 3) | (r >> 2); gg = (gg << 3) | (gg >> 2); b = (b << 3) | (b >> 2);\n"
     "    out[g.y * uint(o.w) * S + g.x] = 0xFF000000u | (r << 16) | (gg << 8) | b;\n"
     "}\n"
+    /* The same display decode into the window's present texture: no CPU
+     * copy. flags 1: also clear the row under the image (linear filtering
+     * at the bottom edge then blends with black, as the CPU path pads). */
+    "kernel void export_present(texture2d<float, access::read> hr [[texture(0)]],\n"
+    "                           texture2d<float, access::write> out [[texture(1)]],\n"
+    "                           constant Op &o [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {\n"
+    "    uint S = o.scale;\n"
+    "    if (g.x >= uint(o.w) * S || g.y >= out.get_height() || g.x >= out.get_width()) return;\n"
+    "    if (g.y >= uint(o.h) * S) {\n"
+    "        if ((o.flags & 1u) && g.y == uint(o.h) * S) out.write(float4(0.0, 0.0, 0.0, 1.0), g);\n"
+    "        return;\n"
+    "    }\n"
+    "    uint2 p = uint2((uint(o.x) * S + g.x) % (1024u * S), (uint(o.y) * S + g.y) % (512u * S));\n"
+    "    float4 c = hr.read(p);\n"
+    "    uint r = uint(rint(c.r * 255.0)) >> 3, gg = uint(rint(c.g * 255.0)) >> 3;\n"
+    "    uint b = uint(rint(c.b * 255.0)) >> 3;\n"
+    "    r = (r << 3) | (r >> 2); gg = (gg << 3) | (gg >> 2); b = (b << 3) | (b >> 2);\n"
+    "    out.write(float4(float(r), float(gg), float(b), 255.0) / 255.0, g);\n"
+    "}\n"
     /* Native VRAM from the image, as OpenGL's pack pass: each native pixel
      * is the top-left sample of its S x S block. */
     "kernel void pack(texture2d<float, access::read> hr [[texture(0)]],\n"
@@ -220,7 +240,8 @@ static NSString *const k_source =
 
 static id<MTLDevice> s_device;
 static id<MTLCommandQueue> s_queue;
-static id<MTLComputePipelineState> s_fill, s_upload, s_gather, s_scatter, s_export, s_pack;
+static id<MTLComputePipelineState> s_fill, s_upload, s_gather, s_scatter, s_export, s_pack,
+    s_export_present;
 static id<MTLRenderPipelineState> s_draw;
 static id<MTLRenderCommandEncoder> s_render;
 static id<MTLTexture> s_hr, s_scratch;
@@ -281,13 +302,15 @@ static int device_ready(void) {
     s_scatter = pipeline(library, @"copy_scatter");
     s_export = pipeline(library, @"export_hires");
     s_pack = pipeline(library, @"pack");
+    s_export_present = pipeline(library, @"export_present");
     MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
     rd.vertexFunction = [library newFunctionWithName:@"draw_vs"];
     rd.fragmentFunction = [library newFunctionWithName:@"draw_fs"];
     rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     s_draw = [s_device newRenderPipelineStateWithDescriptor:rd error:&error];
     s_queue = [s_device newCommandQueue];
-    ok = s_fill && s_upload && s_gather && s_scatter && s_export && s_pack && s_draw && s_queue;
+    ok = s_fill && s_upload && s_gather && s_scatter && s_export && s_pack && s_export_present &&
+         s_draw && s_queue;
     return ok;
 }
 
@@ -911,6 +934,69 @@ static int mb_render_display_hires(uint32_t *out, int pitch, int dx, int dy, int
     for (int row = 0; row < h; ++row)
         memcpy((uint8_t *)out + (size_t)row * pitch, src + (size_t)row * w, (size_t)w * 4);
     return w * h;
+}
+
+/* ---- Direct present ------------------------------------------------------
+ * The window's present texture is an IOSurface the backend also wraps as a
+ * Metal texture. Each frame the display decode writes it on the GPU; SDL's
+ * Metal renderer samples the same surface, so no frame crosses to the CPU. */
+
+static CVPixelBufferRef s_present_pb;
+static id<MTLTexture> s_present_tex;
+
+void *metal_renderer_present_pixel_buffer(int width, int height) {
+    if (!device_ready() || width <= 0 || height <= 0) return NULL;
+    if (s_present_pb && (int)CVPixelBufferGetWidth(s_present_pb) >= width &&
+        (int)CVPixelBufferGetHeight(s_present_pb) >= height)
+        return s_present_pb;
+    if (s_ready) metal_renderer_finish();
+    NSDictionary *attrs = @{
+        (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (NSString *)kCVPixelBufferMetalCompatibilityKey: @YES,
+    };
+    CVPixelBufferRef pb = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, (size_t)width, (size_t)height,
+                            kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs,
+                            &pb) != kCVReturnSuccess || !pb)
+        return NULL;
+    IOSurfaceRef surface = CVPixelBufferGetIOSurface(pb);
+    MTLTextureDescriptor *d =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:(NSUInteger)width
+                                                          height:(NSUInteger)height
+                                                       mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    id<MTLTexture> tex = surface ? [s_device newTextureWithDescriptor:d iosurface:surface plane:0]
+                                 : nil;
+    if (!tex) {
+        CVPixelBufferRelease(pb);
+        return NULL;
+    }
+    if (s_present_pb) CVPixelBufferRelease(s_present_pb);
+    s_present_pb = pb;
+    s_present_tex = tex;
+    return s_present_pb;
+}
+
+int metal_renderer_present_direct(int dx, int dy, int dw, int dh, int pad_row) {
+    if (!s_ready || !s_present_tex || dw <= 0 || dh <= 0) return 0;
+    const int S = s_scale;
+    if ((NSUInteger)(dw * S) > s_present_tex.width || (NSUInteger)(dh * S) > s_present_tex.height)
+        return 0;
+    MetalOp op = {0};
+    op.x = dx & (VRAM_W - 1);
+    op.y = dy & (VRAM_H - 1);
+    op.w = dw;
+    op.h = dh;
+    op.scale = (uint32_t)S;
+    op.flags = pad_row ? 1u : 0u;
+    id<MTLComputeCommandEncoder> e = encoder();
+    [e setTexture:s_hr atIndex:0];
+    [e setTexture:s_present_tex atIndex:1];
+    dispatch(s_export_present, &op, (NSUInteger)dw * S, (NSUInteger)dh * S + (pad_row ? 1u : 0u));
+    /* SDL samples the surface on its own queue: the image must be complete. */
+    metal_renderer_finish();
+    return 1;
 }
 
 static void mb_vram_write(int x, int y, uint16_t pixel) {

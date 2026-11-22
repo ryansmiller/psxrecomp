@@ -13,7 +13,10 @@
  * and 24-bit display is not modelled. Wide compositor ops are not replayed:
  * the Metal backend has no wide surfaces yet. With PARITY_BACKEND=software
  * in the environment the software renderer replays instead, as a faithful
- * reference at 1x, 2x and 4x. */
+ * reference at 1x, 2x and 4x. PARITY_DIRECT=1 captures each Metal frame
+ * through the direct-present surface (metal_renderer_present_direct) instead
+ * of the readback; the digests must not change. */
+#include <CoreVideo/CoreVideo.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,6 +157,8 @@ int main(int argc, char **argv) {
     const int scale = argc > 4 ? atoi(argv[4]) : h.scale;
     const char *which = getenv("PARITY_BACKEND");
     const int software = which && strcmp(which, "software") == 0;
+    const char *dflag = getenv("PARITY_DIRECT");
+    const int direct = !software && dflag && strcmp(dflag, "1") == 0;
     const GpuRenderBackend *k = software ? &k_software : metal_backend_get();
     if (!k) { fprintf(stderr, "SKIP no Metal device\n"); return 77; }
 
@@ -263,7 +268,21 @@ int main(int argc, char **argv) {
             const int w = a[3] * scale, hh = a[4] * scale;
             if (w <= 0 || hh <= 0 || (size_t)w * hh > frame_cap) break;
             memset(frame, 0, (size_t)w * hh * 4);
-            if (!k->render_display_hires(frame, w * 4, a[1], a[2], a[3], a[4])) {
+            if (direct) {
+                CVPixelBufferRef pb = (CVPixelBufferRef)
+                    metal_renderer_present_pixel_buffer(1024 * scale, 512 * scale);
+                if (!pb || !metal_renderer_present_direct(a[1], a[2], a[3], a[4], 0)) {
+                    fprintf(stderr, "FAIL direct present unavailable\n");
+                    ok = 0;
+                    break;
+                }
+                CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+                const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
+                const size_t pitch = CVPixelBufferGetBytesPerRow(pb);
+                for (int y = 0; y < hh; ++y)
+                    memcpy(frame + (size_t)y * w, base + (size_t)y * pitch, (size_t)w * 4);
+                CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            } else if (!k->render_display_hires(frame, w * 4, a[1], a[2], a[3], a[4])) {
                 fprintf(stderr, "FAIL frame %llu not captured\n", (unsigned long long)frames);
                 ok = 0;
                 break;
