@@ -58,6 +58,8 @@ def main():
     ap.add_argument("--frames", default="80")
     ap.add_argument("--single", action="store_true",
                     help="run the fixture once with no arguments; its exit code is the result")
+    ap.add_argument("--probe-args", nargs="*", default=[],
+                    help="with --single: arguments passed to the fixture")
     args = ap.parse_args()
     sdl_includes = [str(pathlib.Path(d).resolve()) for d in args.sdl_include.split(";") if d]
     args.sdl_library = str(pathlib.Path(args.sdl_library).resolve())
@@ -87,7 +89,10 @@ def main():
     sources = [("probe", fixture), ("sw", src / "gpu_sw_renderer.c"),
                ("rp", src / "render_pass_plan.c"),
                ("xr", src / "psx_openxr.c"), ("rth", src / "render_thread.c"), ("pth", src / "present_thread.c"),
-               ("facade", src / "gpu_render.c"), ("fg", src / "frame_gen.c")]
+               ("facade", src / "gpu_render.c")]
+    # frame_gen.c was retired (f874c1e7); older trees still have it.
+    if (src / "frame_gen.c").exists():
+        sources.append(("fg", src / "frame_gen.c"))
     sections = [] if platform.system() == "Darwin" else ["-ffunction-sections", "-fdata-sections"]
     # MinGW's PE linker reports undefined references from sections it later
     # collects, so there LTO drops them first (as run_gl_scale_invariance.py).
@@ -122,7 +127,7 @@ def main():
         return 2
 
     if args.single:
-        r = run([probe])
+        r = run([probe, *args.probe_args])
         print(r.stdout[-6000:], r.stderr[-3000:])
         if r.returncode == SKIP_EXIT:
             print("SKIP:", r.stderr.strip()[-600:])

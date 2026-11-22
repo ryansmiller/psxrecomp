@@ -63,7 +63,9 @@ class Recording:
         return rng.randrange(0, VRAM_W, 16), rng.randrange(VRAM_H), texpage
 
 
-def recording(seed):
+def recording(seed, final_displays=0):
+    """final_displays: high-resolution display reads appended at the end, so
+    a backend replay always has frames to capture."""
     rng = random.Random(seed)
     scale = rng.choice((1, 2, 4))
     out = Recording(rng)
@@ -173,6 +175,9 @@ def recording(seed):
             depth -= 1
     for _ in range(depth):
         out.op("BATCH_END")
+    for _ in range(final_displays):
+        out.op("RENDER_DISPLAY_HIRES", 320 * 4 * scale, rng.randrange(0, VRAM_W - 320 + 1, 8),
+               rng.randrange(0, VRAM_H - 240 + 1), 320, 240, -1)
     out.data += bytes([OPS["END"]]) + struct.pack("<I", 0)
     return bytes(out.data)
 

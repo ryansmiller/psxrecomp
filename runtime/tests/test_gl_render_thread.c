@@ -104,6 +104,14 @@ int psx_present_vsync_owns_cadence(void){
     return 0;
 }
 void latency_ring_mark(LatencyStage s){(void)s;}
+uint64_t latency_ring_current_frame(void){return 0;}
+void latency_ring_replay_frame(uint64_t frame){(void)frame;}
+uint64_t psx_get_cycle_count(void){return 0;}
+/* No extra presentation slots: frames present once each. */
+int psx_presentation_extra_slot(uint64_t m,uint64_t n,uint64_t d,unsigned i,PsxPresentationSlot *s){
+    (void)m;(void)n;(void)d;(void)i;(void)s;return 0;}
+/* Native-wide present: the fixture's frames are 320 wide. */
+int gpu_ws_display_width(void){return 320;}
 void gpu_timeline_note(uint8_t k,uint32_t a,uint32_t b){(void)k;(void)a;(void)b;}
 
 static uint16_t vram[1024*512];

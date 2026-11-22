@@ -867,6 +867,17 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
                 --output "${CMAKE_CURRENT_BINARY_DIR}/gl-blend-accuracy-results")
         set_tests_properties(gl_blend_accuracy_test PROPERTIES
             LABELS "gpu;opengl;hardware" TIMEOUT 180 SKIP_RETURN_CODE 77)
+        # Backend parity reference: a renderer recording replayed through the
+        # facade on OpenGL, every displayed frame captured, twice identically.
+        add_test(NAME gpu_parity_replay_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gpu_parity_replay.py"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gpu-parity-replay-results"
+                --cc "${CMAKE_C_COMPILER}"
+                --sdl-include "${_gl_scale_sdl_inc}"
+                --sdl-library "$<TARGET_FILE:SDL3::SDL3>")
+        set_tests_properties(gpu_parity_replay_test PROPERTIES
+            LABELS "gpu;opengl;hardware" TIMEOUT 300 SKIP_RETURN_CODE 77)
         # texture_filtering = "xbr": diagonals lose the staircase, straight
         # edges, flat areas, cutouts and 1:1 draws stay nearest; RT agrees.
         add_test(NAME gl_xbr_filter_test

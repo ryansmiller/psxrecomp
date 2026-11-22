@@ -84,6 +84,7 @@ extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
+#include "gpu_hw_renderer.h"
 #include "render_pass.h"
 /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
 #define STBI_NO_STDIO
@@ -831,7 +832,7 @@ static void post_load_probe_arm(void) {
     s_post_load_probe_in_stall = 0;
     s_stall_pc_used = 0;
     s_live_pc_used = 0;
-    gl_renderer_present_probe_reset();
+    hw_renderer()->present_probe_reset();
     std::fprintf(stderr,
                  "savestate: post_load_probe armed (300 vblanks; "
                  "PSX_POST_LOAD_PROBE=1; live_pc/ci/adv diag on)\n");
@@ -844,7 +845,7 @@ static void post_load_probe_on_vblank(int turbo_active, int present_reached) {
 
     uint64_t skip = 0, swap = 0, dirty_marks = 0;
     int force_left = 0;
-    gl_renderer_present_probe_take(&skip, &swap, &dirty_marks, &force_left);
+    hw_renderer()->present_probe_take(&skip, &swap, &dirty_marks, &force_left);
     s_post_load_probe_skip_tot += skip;
     s_post_load_probe_swap_tot += swap;
     s_post_load_probe_dirty_tot += dirty_marks;
@@ -963,7 +964,7 @@ static void post_load_probe_on_vblank(int turbo_active, int present_reached) {
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
     const int rect_dirty = (di.width > 0 && di.height > 0)
-        ? gl_renderer_present_rect_dirty((int)di.display_x, (int)di.display_y,
+        ? hw_renderer()->present_rect_dirty((int)di.display_x, (int)di.display_y,
                                          (int)di.width, (int)di.height)
         : 0;
 
@@ -1147,13 +1148,13 @@ extern "C" void psx_frontend_on_savestate_loaded(void) {
      * full-VRAM boot_state blit — so restage the mirror into the FBO/image
      * before present. Otherwise post-FMV menus miss texture pages. Safe
      * no-ops when that backend was never brought up. */
-    gl_renderer_restage_vram_after_savestate();
+    hw_renderer()->restage_vram_after_savestate();
     vk_renderer_restage_vram_after_savestate();
     /* GL present-dirty early-out can skip SwapWindow when the restored frame
      * matches the last swap (typical on 2nd+ load of the same slot). Invalidate
      * tiles + force several swaps so the window actually updates. Safe no-op
      * when the GL pipeline was never brought up. */
-    gl_renderer_invalidate_present();
+    hw_renderer()->invalidate_present();
     post_load_probe_arm();
 }
 
@@ -1176,10 +1177,10 @@ extern "C" void psx_frontend_on_rb_snap_loaded(void) {
         s_disabled_frame_presented = false;
         s_force_present_after_load = true;
     }
-    gl_renderer_restage_vram_after_savestate();
+    hw_renderer()->restage_vram_after_savestate();
     vk_renderer_restage_vram_after_savestate();
     /* Dual-raster: restaged FBO must reach the window; drop hold-last. */
-    gl_renderer_invalidate_present();
+    hw_renderer()->invalidate_present();
     /* §63: guest SIO came from the snap — drop Live pad-edge trackers. */
     psx_netplay_on_rb_snap_loaded();
 }
@@ -1230,7 +1231,7 @@ static float         g_video_scanline_strength = 0.5f;
 extern "C" void psx_video_set_scanlines(int on, float strength) {
     g_video_scanlines = on ? true : false;
     if (strength >= 0.f && strength <= 1.f) g_video_scanline_strength = strength;
-    gl_renderer_set_scanlines(g_video_scanlines ? 1 : 0,
+    hw_renderer()->set_scanlines(g_video_scanlines ? 1 : 0,
                               g_video_scanline_strength);
 }
 extern "C" int psx_video_get_scanlines(float *strength) {
@@ -2233,12 +2234,12 @@ static void update_adaptive_widescreen() {
      * window pillarboxes the rest. A no-op unless the surface would be
      * refused. */
     if (g_ws_native_wide && (int64_t)num * 3 > (int64_t)den * 4)
-        gl_renderer_fit_wide_aspect(gpu_ws_display_width(), &num, &den);
+        hw_renderer()->fit_wide_aspect(gpu_ws_display_width(), &num, &den);
     if (num == g_video_aspect_num && den == g_video_aspect_den) return;
 
     g_video_aspect_num = num;
     g_video_aspect_den = den;
-    gl_renderer_set_display_aspect(num, den);
+    hw_renderer()->set_display_aspect(num, den);
     vk_renderer_set_display_aspect(num, den);
     if (sdl_renderer) {
         g_logical_w = (int)((int64_t)480 * num * g_video_scale / den);
@@ -2298,7 +2299,7 @@ extern "C" int psx_ws_get_native_wide(void) { return g_ws_native_wide; }
 extern "C" int psx_debug_display_aspect(int num, int den, int adaptive) {
     if (adaptive) return psx_mod_set_adaptive_display_aspect(num, den);
     if (!psx_mod_set_fixed_display_aspect(num, den)) return 0;
-    gl_renderer_set_display_aspect(num, den);
+    hw_renderer()->set_display_aspect(num, den);
     vk_renderer_set_display_aspect(num, den);
     if (sdl_renderer) {
         g_logical_w = 480 * num * g_video_scale / den;
@@ -2558,7 +2559,7 @@ static int netplay_cpu_auth_gpu(void) {
 static int netplay_gl_dual_quality(void) {
 #ifndef PSX_SDL_NO_RENDER
     return s_netplay_gl_present && g_gl_active && g_gl_fbo_present &&
-           gl_renderer_cpu_auth_dual();
+           hw_renderer()->cpu_auth_dual();
 #else
     return 0;
 #endif
@@ -2657,7 +2658,7 @@ extern "C" void psx_frontend_netplay_force_sw_gpu(void) {
         int want = g_video_scale < 1 ? 1 : g_video_scale;
         if (want > GL_MAX_INTERNAL_SCALE) want = GL_MAX_INTERNAL_SCALE;
         gr_set_backend(GR_BACKEND_OPENGL);
-        gl_renderer_set_cpu_auth_dual(1);
+        hw_renderer()->set_cpu_auth_dual(1);
         /* FBO scale is fixed at context init — keep request in sync. */
         gr_set_scale(want);
         s_netplay_sim_native_scale = 1;
@@ -2682,8 +2683,8 @@ extern "C" void psx_frontend_netplay_force_sw_gpu(void) {
      * arming dual. Caller must invoke this before g_np.active (ensure_cpu
      * no-ops while netplay is active). */
     if (g_gl_active && gr_backend() == GR_BACKEND_OPENGL &&
-        !gl_renderer_cpu_auth_dual())
-        gl_renderer_sync_cpu();
+        !hw_renderer()->cpu_auth_dual())
+        hw_renderer()->sync_cpu();
     if (g_vk_active) {
         /* Vulkan CPU-auth present not wired yet — tear down to SW SDL. */
         vk_renderer_sync_cpu();
@@ -2700,13 +2701,13 @@ extern "C" void psx_frontend_netplay_force_sw_gpu(void) {
         int want = g_video_scale < 1 ? 1 : g_video_scale;
         if (want > GL_MAX_INTERNAL_SCALE) want = GL_MAX_INTERNAL_SCALE;
         gr_set_backend(GR_BACKEND_OPENGL);
-        gl_renderer_set_cpu_auth_dual(1);
+        hw_renderer()->set_cpu_auth_dual(1);
         gr_set_scale(want);
         g_gl_fbo_present = true;
         s_netplay_gl_present = 1;
         s_netplay_sim_native_scale = 1;
-        gl_renderer_restage_vram_after_savestate();
-        gl_renderer_invalidate_present();
+        hw_renderer()->restage_vram_after_savestate();
+        hw_renderer()->invalidate_present();
         s_netplay_sw_gpu_locked = 1;
         latency_ring_set_backend("opengl");
         fprintf(stderr,
@@ -2720,7 +2721,7 @@ extern "C" void psx_frontend_netplay_force_sw_gpu(void) {
      * Do not clear g_video_renderer — that preference must survive rematch /
      * first settings.toml write so OpenGL stays the user's default. */
     g_gl_fbo_present = false;
-    gl_renderer_set_cpu_auth_dual(0);
+    hw_renderer()->set_cpu_auth_dual(0);
     gr_set_backend(GR_BACKEND_SOFTWARE);
     gr_set_scale(1);
     s_netplay_sim_native_scale = 1;
@@ -3964,7 +3965,7 @@ static void refresh_host_display_cadence(int force_log, int force_probe) {
     g_host_refresh_display_idx = disp_idx;
     g_host_refresh_hz = host_hz;
     if (display_changed || refresh_changed)
-        gl_renderer_invalidate_display_rate();
+        hw_renderer()->invalidate_display_rate();
     g_frame_period_ms = g_guest_frame_period_ms;
     if (host_refresh_matches_guest_cadence()) {
         g_frame_period_ms = 1000.0 / host_hz;
@@ -4113,7 +4114,7 @@ extern "C" void psx_display_timing_json(char *out, int cap) {
     SpuShadowInfo shadow{};
     spu_shadow_get_info(&shadow);
     char swaps[2048];
-    gl_renderer_swap_timing_json(swaps, sizeof(swaps));
+    hw_renderer()->swap_timing_json(swaps, sizeof(swaps));
     std::snprintf(out, (size_t)cap,
         "\"pal\":%d,\"guest_hz\":%.6f,\"pacer_hz\":%.6f,"
         "\"host_hz\":%.3f,\"vsync_requested\":%d,\"swap_requested\":%d,"
@@ -4159,7 +4160,7 @@ static void apply_present_cadence(void) {
 #ifndef PSX_SDL_NO_RENDER
     const int interval = present_effective_swap_interval();
     if (g_gl_active)
-        gl_renderer_set_swap_interval(interval);
+        hw_renderer()->set_swap_interval(interval);
     if (g_vk_active)
         vk_renderer_set_present_mode(interval);
     if (sdl_renderer)
@@ -4466,7 +4467,7 @@ static void teardown_game_session_keep_lobby(void) {
          * them, then shut the renderer down. The next session attaches again. */
         gl_renderer_render_thread_stop();
         recomp_overlay_detach();
-        gl_renderer_shutdown();
+        hw_renderer()->shutdown();
         g_gl_active = false;
     }
     if (sdl_texture) { SDL_DestroyTexture(sdl_texture); sdl_texture = nullptr; }
@@ -4480,7 +4481,7 @@ static void teardown_game_session_keep_lobby(void) {
     s_netplay_sw_gpu_locked = 0;
     s_netplay_gl_present = 0;
     s_netplay_sim_native_scale = 0;
-    gl_renderer_set_cpu_auth_dual(0);
+    hw_renderer()->set_cpu_auth_dual(0);
     sw_set_faithful_authority(0);
     if (!g_ovl_launch_to_start) {
         psx_lobby_set_ready(0);
@@ -8225,7 +8226,7 @@ static void netplay_hold_last_present_tick(void) {
         return;
 #ifndef PSX_SDL_NO_RENDER
     if (g_gl_active) {
-        did = gl_renderer_present_hold_last();
+        did = hw_renderer()->present_hold_last();
     } else if (!g_vk_active && sdl_renderer && sdl_texture && s_sw_hold_valid) {
         SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
         SDL_RenderClear(sdl_renderer);
@@ -8954,7 +8955,7 @@ static void rewind_pause_present(void) {
         /* A menu can pause before the first guest present. Give its draw
          * callback a blank host frame when no held frame exists, or input
          * handled during draw (including Resume) can never release pause. */
-        if (!gl_renderer_present_hold_last()) gl_renderer_present_blank();
+        if (!hw_renderer()->present_hold_last()) hw_renderer()->present_blank();
     } else if (g_vk_active) {
         vk_renderer_present_blank();
     } else if (sdl_renderer) {
@@ -9551,7 +9552,7 @@ static void headless_present_image_ring_capture(void) {
         int scale = gr_scale();
         w = cw * scale; h = (int)vh * scale;
         buf.resize((size_t)w * h);
-        if (gl_renderer_capture_display_hires(buf.data(), w * 4, cx, cy,
+        if (hw_renderer()->capture_display_hires(buf.data(), w * 4, cx, cy,
                                               cw, (int)vh) != w * h) return;
         present_image_ring_push_argb((uint32_t)s_frame_count, buf.data(), w, h, w);
         return;
@@ -10610,7 +10611,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     bool game_view_applied = false;
     uint32_t gv_x = 0, gv_y = 0, gv_w = 0, gv_h = 0;
     if (s_force_present_after_load && g_gl_active)
-        gl_renderer_flush_cpu_uploads();
+        hw_renderer()->flush_cpu_uploads();
     {
         GpuDisplayInfo di;
         gpu_get_display_info(&di);
@@ -10627,7 +10628,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 s_disabled_frame_presented = true;
                 s_force_present_after_load = false;
                 if (g_gl_active) {
-                    gl_renderer_present_blank();
+                    hw_renderer()->present_blank();
                 } else if (g_vk_active) {
                     vk_renderer_present_blank();
                 } else {
@@ -10729,7 +10730,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * The CPU crop below reads the 1x canonical frame, which throws away
          * internal resolution and smears the proportion-corrected HUD. */
         if (g_gl_active && g_gl_fbo_present && game_view) {
-            gl_renderer_present_vram((int)(di.display_x + gv_x),
+            hw_renderer()->present_vram((int)(di.display_x + gv_x),
                                      (int)(di.display_y + gv_y),
                                      (int)gv_w, (int)gv_h,
                                      g_video_aa ? 1 : 0, 1);
@@ -10741,7 +10742,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             const int half = (int)w / 2;
             const int half_x = (int)di.display_x +
                 (local_viewport_slot == 1 ? (int)w - half : 0);
-            gl_renderer_present_vram(half_x, (int)di.display_y, half, (int)h,
+            hw_renderer()->present_vram(half_x, (int)di.display_y, half, (int)h,
                                      g_video_aa ? 1 : 0, 0);
             netplay_note_present();
             return ep;
@@ -10758,7 +10759,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                  * the wide surface for this buffer doesn't exist yet. */
                 const int wide_base = local_viewport_wide
                     ? gpu_ws_netplay_local_viewport_base_x() : (int)di.display_x;
-                if (gl_renderer_present_wide_fbo(wide_base, (int)di.display_y,
+                if (hw_renderer()->present_wide_fbo(wide_base, (int)di.display_y,
                                                  (int)h, g_video_aa ? 1 : 0)) {
                     netplay_note_present();
                     return ep;
@@ -10781,18 +10782,18 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                         const auto remaining = (uint64_t)((double)(next - counter) * 1e9 / frequency);
                         const uint64_t now = rt_now_ns();
                         if (remaining <= period_ns && now >= period_ns)
-                            gl_renderer_set_display_rate_timing(now + remaining - period_ns,
+                            hw_renderer()->set_display_rate_timing(now + remaining - period_ns,
                                 now + remaining, (uint64_t)(1e9 / g_host_refresh_hz));
                     }
                 }
-                gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
+                hw_renderer()->present_vram((int)di.display_x, (int)di.display_y,
                                          (int)present_w, (int)h, g_video_aa ? 1 : 0,
                                          (fmv_frame || nw_pin) ? 1 : 0);
                 netplay_note_present();
                 return ep;
             }
         }
-        if (g_gl_active && !di.depth24) gl_renderer_sync_cpu();
+        if (g_gl_active && !di.depth24) hw_renderer()->sync_cpu();
         /* Vulkan owns every frame: 15-bit frames present straight from the GPU
          * VRAM image (deterministic blit, no readback), mirroring the GL path;
          * 24-bit (FMV) frames go through the CPU present (Phase 3). The Vulkan
@@ -10942,9 +10943,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * into it instead of smearing whole texels. Measured: the
          * right-edge jump the old comment describes is 0 with filtering on.
          * Set video AA off to get nearest back. */
-        gl_renderer_set_fmv_filter(g_video_fmv_filter);
-        gl_renderer_note_present_depth24(depth24_frame ? 1 : 0);
-        gl_renderer_present(sdl_pixel_buf, src_w, src_h,
+        hw_renderer()->set_fmv_filter(g_video_fmv_filter);
+        hw_renderer()->note_present_depth24(depth24_frame ? 1 : 0);
+        hw_renderer()->present(sdl_pixel_buf, src_w, src_h,
                             g_video_aa ? 1 : 0,
                             pin_43 ? 1 : 0, 0 /* full width */,
                             psx_cycle_count, s_frame_count, s_fmv_timeline_epoch,
@@ -11126,7 +11127,7 @@ static int dynres_min_value(void) {
 static void dynres_setup(void) {
     if (g_dynres.trace) { std::fclose(g_dynres.trace); g_dynres.trace = nullptr; }
     g_dynres = DynresHost{};
-    const int ceiling = g_gl_active ? gl_renderer_dynamic_resolution_ceiling() : 0;
+    const int ceiling = g_gl_active ? hw_renderer()->dynamic_resolution_ceiling() : 0;
     if (ceiling < 2) {
         if (dynres_requested() && g_gl_active)
             std::fprintf(stdout, "psxrecomp: dynamic resolution off: the internal "
@@ -11157,7 +11158,7 @@ static void dynres_setup(void) {
             g_dynres.active = true;
             const int l = dynres_force(&g_dynres.ctl, n);
             (void)dynrt_force(&g_dynres.rt, n);
-            (void)gl_renderer_step_internal_scale_now(l);
+            (void)hw_renderer()->step_internal_scale_now(l);
         }
     }
     if (const char* e = std::getenv("PSX_DYNRES_TRACE"))
@@ -11216,17 +11217,17 @@ static void host_look_apply_live(void) {
     g_video_texfilter = look.texture_filter;
     if (g_mod_texfilter < 0) gr_set_texture_filter(g_video_texfilter);
     g_video_fmv_filter = look.fmv_filter;
-    if (g_gl_active) gl_renderer_set_fmv_filter(g_video_fmv_filter);
+    if (g_gl_active) hw_renderer()->set_fmv_filter(g_video_fmv_filter);
     g_video_dithering = resolve_host_dithering(look.dithering);
-    if (g_gl_active) gl_renderer_set_dithering(g_video_dithering);
+    if (g_gl_active) hw_renderer()->set_dithering(g_video_dithering);
     const PsxHostPostLook post = psx_host_enh_resolve_post(&g_title_post_look, &req);
     g_video_post_aa = g_video_post_aa_env >= 0 ? g_video_post_aa_env : post.antialiasing;
     g_video_bloom = post.bloom;
     g_video_post_shader = post.shader ? post.shader : "";
     if (g_gl_active) {
-        (void)gl_renderer_set_post_aa(g_video_post_aa);
-        gl_renderer_set_bloom(g_video_bloom);
-        gl_renderer_set_post_shader(g_video_post_shader.c_str());
+        (void)hw_renderer()->set_post_aa(g_video_post_aa);
+        hw_renderer()->set_bloom(g_video_bloom);
+        hw_renderer()->set_post_shader(g_video_post_shader.c_str());
     }
 }
 
@@ -11277,7 +11278,7 @@ static void video_res_set_applied(int ir, int ss) {
 
 static void video_res_refresh_capable(void) {
     g_video_res_live_capable.store(g_gl_active && g_video_scale_applies &&
-                                   gl_renderer_internal_scale_live_capable() != 0);
+                                   hw_renderer()->internal_scale_live_capable() != 0);
 }
 
 /* Other restart-only settings still compare against boot. Resolution compares
@@ -11349,7 +11350,7 @@ static int video_resolution_apply_live(int ir, int dynres, int ss_milli) {
         /* No value anywhere: the title's legacy factor is the scale. */
         if (effective_internal_resolution() == PSX_IR_UNSET) g_video_scale = g_title_scale;
         apply_internal_resolution(match_display_px_h(sdl_window));
-        applied = gl_renderer_set_internal_scale_live(g_video_scale);
+        applied = hw_renderer()->set_internal_scale_live(g_video_scale);
     }
     if (applied) {
         std::fprintf(stdout, "psxrecomp: internal scale %dx (live)\n", applied);
@@ -11368,7 +11369,7 @@ static int video_resolution_apply_live(int ir, int dynres, int ss_milli) {
         g_dynres.active = false;
     } else if (!was_dynres || !g_dynres.active) {
         dynres_setup();
-        if (!g_dynres.active && gl_renderer_dynamic_resolution_ceiling() >= 2)
+        if (!g_dynres.active && hw_renderer()->dynamic_resolution_ceiling() >= 2)
             g_dynres.active = true;
     }
     return applied ? 1 : 0;
@@ -11517,7 +11518,7 @@ static int debug_toggle_key(int key, char *out, int cap) {
         break; }
     case SDLK_2:
         if (g_dynres.active) g_dynres.active = false;
-        else { dynres_setup(); if (!g_dynres.active && gl_renderer_dynamic_resolution_ceiling() >= 2) g_dynres.active = true; }
+        else { dynres_setup(); if (!g_dynres.active && hw_renderer()->dynamic_resolution_ceiling() >= 2) g_dynres.active = true; }
         s_dbg_scale_target = 0;
         std::snprintf(msg, sizeof msg, "Dynamic resolution: %s", g_dynres.active ? "on" : "off");
         break;
@@ -11610,7 +11611,7 @@ static void dynres_apply_level(int level) {
     if (level == st.level) return;
     const int from = st.level;
     const uint64_t t0 = SDL_GetPerformanceCounter();
-    const int ok = gl_renderer_step_internal_scale_now(level);
+    const int ok = hw_renderer()->step_internal_scale_now(level);
     const uint64_t t1 = SDL_GetPerformanceCounter();
     const double sec = (double)(t1 - t0) / (double)SDL_GetPerformanceFrequency();
     if (ok) {
@@ -18364,8 +18365,8 @@ void ovl_look_service(void) {
     const int aa = g_ovl_sess_aa.exchange(-1);
     const int dither = g_ovl_sess_dither.exchange(-1);
     if (aa < 0 && dither < 0) return;
-    if (aa >= 0) { g_video_post_aa = aa; (void)gl_renderer_set_post_aa(aa); }
-    if (dither >= 0) { g_video_dithering = dither; gl_renderer_set_dithering(dither); }
+    if (aa >= 0) { g_video_post_aa = aa; (void)hw_renderer()->set_post_aa(aa); }
+    if (dither >= 0) { g_video_dithering = dither; hw_renderer()->set_dithering(dither); }
 }
 
 int ovl_window_scale_now(void) {
@@ -21980,13 +21981,13 @@ session_reboot:
      * present not yet cpu-auth — fall back to a software window. */
     s_netplay_gl_present = 0;
     s_netplay_sim_native_scale = 0;
-    gl_renderer_set_cpu_auth_dual(0);
+    hw_renderer()->set_cpu_auth_dual(0);
     if (net_cfg.enabled) {
         s_netplay_sim_native_scale = 1;
         if (g_video_renderer == 1) {
             s_netplay_gl_present = 1;
             g_gl_fbo_present = 1;
-            gl_renderer_set_cpu_auth_dual(1);
+            hw_renderer()->set_cpu_auth_dual(1);
             gr_set_backend(GR_BACKEND_OPENGL);
             std::fprintf(stdout,
                          "psxrecomp: netplay — dual-raster "
@@ -22086,7 +22087,7 @@ session_reboot:
             g_video_scale = ceiling;
         }
     }
-    if (net_cfg.enabled && s_netplay_gl_present && gl_renderer_cpu_auth_dual()) {
+    if (net_cfg.enabled && s_netplay_gl_present && hw_renderer()->cpu_auth_dual()) {
         gr_set_scale(g_video_scale);
         if (g_video_scale > 1) {
             std::fprintf(stdout,
@@ -22113,7 +22114,7 @@ session_reboot:
     g_video_requested_scale = requested_scale;
     g_video_scale_applies = !(net_cfg.enabled || s_netplay_sim_native_scale) ||
                             (net_cfg.enabled && s_netplay_gl_present &&
-                             gl_renderer_cpu_auth_dual());
+                             hw_renderer()->cpu_auth_dual());
     g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
     /* This session's look: the title's baseline and the host enhancement
      * mods' requests from start_mod_session's activation, which ran above for
@@ -22171,7 +22172,7 @@ session_reboot:
     gl_renderer_set_texture_lod(g_video_texture_lod, g_video_aniso);
     if (const char* e = std::getenv("PSX_ACCURATE_BLENDING")) g_video_accurate_blending = (*e && *e != '0');
     gl_renderer_set_accurate_blending(g_video_accurate_blending);
-    gl_renderer_set_dithering(g_video_dithering);
+    hw_renderer()->set_dithering(g_video_dithering);
     gl_renderer_set_pgxp_color_perspective(g_video_pgxp_color_correction);
     gl_renderer_set_pgxp_seam(g_video_pgxp_seam);
     if (const char* e = std::getenv("PSX_PGXP_DEPTH_THRESHOLD")) g_video_pgxp_depth_threshold = (float)std::atof(e);
@@ -22212,7 +22213,7 @@ session_reboot:
         float s = (float)atof(e);
         if (s >= 0.f && s <= 1.f) g_video_scanline_strength = s;
     }
-    gl_renderer_set_scanlines(g_video_scanlines ? 1 : 0,
+    hw_renderer()->set_scanlines(g_video_scanlines ? 1 : 0,
                               g_video_scanline_strength);
     if (pgxp_arm.geometry || pgxp_arm.texture) {
         std::fprintf(stdout,
@@ -22227,7 +22228,7 @@ session_reboot:
     /* Display aspect. Identity at the default 4:3. The present letterbox uses
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */
-    gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    hw_renderer()->set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     vk_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
@@ -22569,15 +22570,15 @@ session_reboot:
             SDL_Quit();
             return 1;
         }
-        gl_renderer_set_swap_interval(0);
-        (void)gl_renderer_set_post_aa(g_video_post_aa);
-        gl_renderer_set_bloom(g_video_bloom);
-        gl_renderer_set_post_shader(g_video_post_shader.c_str());
-        g_gl_active = gl_renderer_init_context(s_headless_gl_window) != 0;
+        hw_renderer()->set_swap_interval(0);
+        (void)hw_renderer()->set_post_aa(g_video_post_aa);
+        hw_renderer()->set_bloom(g_video_bloom);
+        hw_renderer()->set_post_shader(g_video_post_shader.c_str());
+        g_gl_active = hw_renderer()->init_context(s_headless_gl_window) != 0;
         if (!g_gl_active || gr_backend() != GR_BACKEND_OPENGL ||
             !(SDL_GetWindowFlags(s_headless_gl_window) & SDL_WINDOW_HIDDEN)) {
             std::fprintf(stderr, "psxrecomp: hidden OpenGL validation unavailable; refusing fallback\n");
-            if (g_gl_active) gl_renderer_shutdown();
+            if (g_gl_active) hw_renderer()->shutdown();
             SDL_DestroyWindow(s_headless_gl_window);
             s_headless_gl_window = nullptr;
             SDL_Quit();
@@ -22774,7 +22775,7 @@ session_reboot:
                          "%d px -> %dx requested (supersample %.3gx)\n",
                          label ? label : "custom", dh, s, ss / 1000.0);
         }
-        gl_renderer_set_swap_interval(present_effective_swap_interval()); /* applied at context init */
+        hw_renderer()->set_swap_interval(present_effective_swap_interval()); /* applied at context init */
 
         /* Dynamic resolution: the surfaces are allocated at the scale above
          * (the ceiling) and the level steps under it (dynres_setup). */
@@ -22796,19 +22797,19 @@ session_reboot:
 #endif
         gl_renderer_set_dynamic_resolution(
             ((dynres_requested() || dbg_live_scale) && g_video_scale_applies) ? 1 : 0);
-        (void)gl_renderer_set_post_aa(g_video_post_aa);
-        gl_renderer_set_bloom(g_video_bloom);
-        gl_renderer_set_post_shader(g_video_post_shader.c_str());
-        g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
+        (void)hw_renderer()->set_post_aa(g_video_post_aa);
+        hw_renderer()->set_bloom(g_video_bloom);
+        hw_renderer()->set_post_shader(g_video_post_shader.c_str());
+        g_gl_active = (hw_renderer()->init_context(sdl_window) != 0);
         dynres_setup();
         psx_video_current(&g_video_boot);  /* boot snapshot for restart-only rows */
         recomp_overlay_setup(argv[0], s_picker_game_name, disc_path_str,
                              ctrl_lock_mode, ctrl_lock_device, ctrl_locked_mode);
         if (dbg_live_scale && g_gl_active) {
             if (!dynres_requested()) g_dynres.active = false;
-            const int ceil_s = gl_renderer_dynamic_resolution_ceiling();
+            const int ceil_s = hw_renderer()->dynamic_resolution_ceiling();
             if (ceil_s >= 2 && !g_dynres.active)
-                (void)gl_renderer_step_internal_scale_now(dbg_start_scale);
+                (void)hw_renderer()->step_internal_scale_now(dbg_start_scale);
             std::fprintf(stdout, "psxrecomp: debug toggles: surfaces at %dx, "
                          "starting at %dx (keys 0-9)\n", ceil_s, dbg_start_scale);
         }
@@ -22851,7 +22852,7 @@ session_reboot:
         }
         if (!g_gl_active) {
             gr_set_backend(GR_BACKEND_SOFTWARE);
-            gl_renderer_set_cpu_auth_dual(0);
+            hw_renderer()->set_cpu_auth_dual(0);
             g_gl_fbo_present = 0;
             s_netplay_gl_present = 0;
             if (net_cfg.enabled) {
@@ -22861,7 +22862,7 @@ session_reboot:
         } else if (net_cfg.enabled || s_netplay_gl_present) {
             /* Dual-raster: FBO present at settings SSAA; SW@1× authority.
              * Scale was applied via s_req_scale before init_gpu_raster. */
-            gl_renderer_set_cpu_auth_dual(1);
+            hw_renderer()->set_cpu_auth_dual(1);
             g_gl_fbo_present = 1;
             s_netplay_gl_present = 1;
             s_netplay_sim_native_scale = 1;
@@ -23656,7 +23657,7 @@ session_reboot:
                    g_slice_exit_in_text, g_slice_exit_want); }
 
     shutdown_runtime();
-    if (g_gl_active) gl_renderer_shutdown();
+    if (g_gl_active) hw_renderer()->shutdown();
     SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
     SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */
     SDL_DestroyWindow(sdl_window);
