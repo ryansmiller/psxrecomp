@@ -27,7 +27,7 @@ extern SDL_Thread *fmv_hd_test_start_thread(SDL_ThreadFunction, void *);
 #define realloc fmv_hd_test_realloc
 #endif
 
-#define FMV_MAX_MOVIES   16
+#define FMV_MAX_MOVIES   256
 #define FMV_RING         32
 #define FMV_WORKERS      6
 #define FMV_FILE_MAX     (64u * 1024u * 1024u)

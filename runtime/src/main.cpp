@@ -1,3 +1,4 @@
+#include "gpu_fmv_hd.h"
 #include "audio_sync.h"
 #include "audio_catchup.h"
 /* main.cpp — Phase 3 runtime entry point.
@@ -11111,6 +11112,51 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                           (int)(src_w * sizeof(uint32_t)));
     }
 
+    /* HD movie replacement (gpu_fmv_hd) on the SDL present path, as the OpenGL
+     * renderer does: a recognised 24-bit frame is replaced by the pack's HD
+     * frame, shown at its own aspect ratio with linear filtering. */
+    bool fmv_hd_shown = false;
+    if (depth24_frame && !direct_present) {
+        FmvHdTimeline timeline;
+        timeline.cycle = psx_cycle_count;
+        timeline.frame = s_frame_count;
+        timeline.epoch = s_fmv_timeline_epoch;
+        timeline.stream_generation = cdrom_get_stream_generation();
+        timeline.stream_lba = (int32_t)cdrom_get_stream_start_lba();
+        timeline.delivered_lba = (int32_t)cdrom_get_delivered_lba();
+        timeline.decode_serial = (uint32_t)mdec_get_decode_count();
+        FmvHdImage hd;
+        if (gpu_fmv_hd_lookup(sdl_pixel_buf, src_w, src_h, 0, timeline, &hd)) {
+            static SDL_Texture *s_hd_tex = nullptr;
+            static int s_hd_w = 0, s_hd_h = 0;
+            static uint64_t s_hd_serial = 0;
+            if (!s_hd_tex || s_hd_w != hd.w || s_hd_h != hd.h) {
+                if (s_hd_tex) SDL_DestroyTexture(s_hd_tex);
+                s_hd_tex = SDL_CreateTexture(sdl_renderer, SDL_PIXELFORMAT_ABGR8888,
+                                             SDL_TEXTUREACCESS_STREAMING, hd.w, hd.h);
+                if (s_hd_tex) SDL_SetTextureScaleMode(s_hd_tex, SDL_ScaleModeLinear);
+                s_hd_w = hd.w; s_hd_h = hd.h; s_hd_serial = hd.serial - 1;
+            }
+            if (s_hd_tex) {
+                if (hd.serial != s_hd_serial) {   /* upload only when the image changes */
+                    SDL_UpdateTexture(s_hd_tex, nullptr, hd.rgba, hd.w * 4);
+                    s_hd_serial = hd.serial;
+                }
+                const int box_w = g_logical_w, box_h = 480 * tex_scale;
+                int dw = box_w, dh = (int)((int64_t)box_w * hd.h / hd.w);
+                if (dh > box_h) { dh = box_h; dw = (int)((int64_t)box_h * hd.w / hd.h); }
+                SDL_Rect hd_dst = { (box_w - dw) / 2, (box_h - dh) / 2, dw, dh };
+                SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
+                SDL_RenderClear(sdl_renderer);
+                SDL_RenderCopy(sdl_renderer, s_hd_tex, nullptr, &hd_dst);
+                host_osd_draw_sdl(sdl_renderer);
+                fmv_hd_shown = true;
+            }
+        }
+    } else if (!depth24_frame) {
+        gpu_fmv_hd_reset_tracking();
+    }
+
     /* FMV (24-bit) frames are authored 4:3 with no GTE squash to compensate
      * the widescreen stretch — pillarbox them at native 4:3 instead. Same for
      * native-wide game frames that could not present wide (pin_43): canonical
@@ -11141,10 +11187,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     /* Always clear black: hot-path RenderClear used to inherit the backend
      * default draw color (often white), so letterbox margins under short FMV
      * bands flashed as a bright strip on some X11 SDL drivers. */
-    SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
-    SDL_RenderClear(sdl_renderer);
-    SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
-    host_osd_draw_sdl(sdl_renderer);
+    if (!fmv_hd_shown) {
+        SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
+        SDL_RenderClear(sdl_renderer);
+        SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
+        host_osd_draw_sdl(sdl_renderer);
+    }
     /* §33: remember active rect for resim hold-last (not full 640x512). */
     s_sw_hold_src = src;
     s_sw_hold_dst = dst;
