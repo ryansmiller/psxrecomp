@@ -29,6 +29,13 @@ enum { VRAM_W = 1024, VRAM_H = 512, MAX_SCALE = 4 };
 int g_ws_bd_stretch_on, g_ws_bd_stretch_pct;
 int psx_ws_prim_in_backdrop(void) { return 0; }
 int g_psx_vram_dirty_tracking = 1;
+/* gpu_metal_renderer.m links into every Metal target; this replay never
+ * selects that backend, so a halt there is a failure. */
+void psx_fatal_halt(const char *reason) {
+    fprintf(stderr, "FAIL fatal halt: %s\n", reason);
+    exit(1);
+}
+
 static unsigned char g_dirty[VRAM_H];
 void gpu_vram_dirty_mark_row_impl(uint32_t y) { if (y < VRAM_H) g_dirty[y] = 1; }
 void gpu_vram_dirty_mark_rect(int x, int y, int w, int h) {
