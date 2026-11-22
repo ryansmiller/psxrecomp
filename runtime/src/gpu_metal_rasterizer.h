@@ -20,6 +20,8 @@ enum {
     PSX_METAL_CHECK_MASK = 1u,
     PSX_METAL_SET_MASK = 2u,
     PSX_METAL_TRACK_DIRTY = 4u,    /* writes mark the row dirty */
+    PSX_METAL_PERSPECTIVE = 8u,    /* textured triangle: perspective-correct uv */
+    PSX_METAL_SHADED = 16u,        /* textured triangle: per-pixel modulation */
 };
 
 enum {
@@ -27,6 +29,7 @@ enum {
     PSX_METAL_SPRITE = 1,          /* texel (u + col / w, v + row / w) */
     PSX_METAL_SCALED_SPRITE = 2,   /* texel (u + du * col / w, v + dv * row / h) */
     PSX_METAL_GOURAUD = 3,         /* colour from the entry's row attributes */
+    PSX_METAL_TEX_TRIANGLE = 4,    /* uv (and shading) from the row attributes */
 };
 
 /* All fields are 32-bit so the Metal struct has the same layout.
@@ -40,7 +43,8 @@ typedef struct {
     int32_t x, y, u, v, w, h, du, dv;
 } PsxMetalPrimitive;
 
-/* attr indexes the batch's row attributes for kinds that need them. */
+/* attr is the word offset of the entry's row attributes, for kinds that
+ * have them. */
 typedef struct {
     uint32_t row, x, width, primitive, attr;
 } PsxMetalEntry;
@@ -50,6 +54,14 @@ typedef struct {
 typedef struct {
     int32_t xa, span, ra, ga, ba, rb, gb, bb;
 } PsxMetalRowAttr;
+
+/* A textured-triangle row, as gpu_sw_renderer.c's tex_row computes it:
+ * unclipped left edge, span (at least 1), and the edge values of u, v, q,
+ * u*q, v*q and the 5-bit modulation colours. */
+typedef struct {
+    int32_t xa, span;
+    float ua, ub, va, vb, qa, qb, uqa, uqb, vqa, vqb, ra, rb, ga, gb, ba, bb;
+} PsxMetalTexAttr;
 
 /* Drops any shared Metal buffer wrapping memory before it is freed. */
 void psx_metal_forget_memory(const void *memory);
@@ -68,7 +80,7 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
                          const PsxMetalPrimitive *primitives,
                          uint32_t primitive_count,
                          const PsxMetalEntry *entries, uint32_t entry_count,
-                         const PsxMetalRowAttr *attrs, uint32_t attr_count,
+                         const uint32_t *attr_words, uint32_t attr_word_count,
                          unsigned char *dirty_rows);
 
 #endif

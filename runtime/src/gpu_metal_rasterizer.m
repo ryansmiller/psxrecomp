@@ -51,6 +51,8 @@ static NSString *const shader =
 
 static NSString *const batch_shader =
     @"#include <metal_stdlib>\n"
+    /* The CPU reference rounds every product and sum (-ffp-contract=off). */
+    "#pragma METAL fp contract(off)\n"
     "using namespace metal;\n"
     "struct Primitive {\n"
     "    uint kind, color, blend, flags, texpage, clut, window;\n"
@@ -59,6 +61,10 @@ static NSString *const batch_shader =
     "struct Entry { uint x, width, primitive, attr; };\n"
     "struct Row { uint pixel, x, width, first, count, y; };\n"
     "struct Attr { int xa, span, ra, ga, ba, rb, gb, bb; };\n"
+    "struct TexAttr {\n"
+    "    int xa, span;\n"
+    "    float ua, ub, va, vb, qa, qb, uqa, uqb, vqa, vqb, ra, rb, ga, gb, ba, bb;\n"
+    "};\n"
     /* gpu_sw_renderer.c vram_get and texel_fetch: VRAM wraps at 1024x512. */
     "static uint vram_get(device const ushort *vram, int x, int y) {\n"
     "    return vram[uint(y & 511) * 1024u + uint(x & 1023)];\n"
@@ -105,7 +111,7 @@ static NSString *const batch_shader =
     "                         constant Primitive *primitives [[buffer(3)]],\n"
     "                         device atomic_uint *dirty [[buffer(4)]],\n"
     "                         device const ushort *vram [[buffer(5)]],\n"
-    "                         constant Attr *attrs [[buffer(6)]],\n"
+    "                         constant uint *attrs [[buffer(6)]],\n"
     "                         uint2 xy [[thread_position_in_grid]]) {\n"
     "    Row row = rows[xy.y];\n"
     "    if (xy.x >= row.width) return;\n"
@@ -125,7 +131,7 @@ static NSString *const batch_shader =
     /* gpu_sw_renderer.c raster_gouraud_triangle, per pixel. Safe math keeps
      * the float division and products identical to the CPU. */
     "        } else if (p.kind == 3u) {\n"
-    "            Attr a = attrs[entry.attr];\n"
+    "            Attr a = *(constant Attr *)(attrs + entry.attr);\n"
     "            if (a.span > 0) {\n"
     "                float tf = float(int(x) - a.xa) / float(a.span);\n"
     "                int r = clamp(a.ra + int(float(a.rb - a.ra) * tf), 0, 31);\n"
@@ -139,7 +145,28 @@ static NSString *const batch_shader =
     "        } else {\n"
     "            int col = int(x) - p.x, line = int(row.y) - p.y;\n"
     "            int u, v;\n"
-    "            if (p.kind == 1u) {\n"
+    "            uint mr = p.color & 0xFFu, mg = (p.color >> 8) & 0xFFu, mb = (p.color >> 16) & 0xFFu;\n"
+    "            if (p.kind == 4u) {\n"
+    /* gpu_sw_renderer.c tex_uv and the shaded modulation, per pixel. */
+    "                TexAttr a = *(constant TexAttr *)(attrs + entry.attr);\n"
+    "                float t = float(int(x) - a.xa) / float(a.span);\n"
+    "                float fu = a.ua + (a.ub - a.ua) * t;\n"
+    "                float fv = a.va + (a.vb - a.va) * t;\n"
+    "                if (p.flags & 8u) {\n"
+    "                    float q = a.qa + (a.qb - a.qa) * t;\n"
+    "                    if (q > 1.0e-12f) {\n"
+    "                        fu = (a.uqa + (a.uqb - a.uqa) * t) / q;\n"
+    "                        fv = (a.vqa + (a.vqb - a.vqa) * t) / q;\n"
+    "                    }\n"
+    "                }\n"
+    "                u = int(fu) & 0xFF;\n"
+    "                v = int(fv) & 0xFF;\n"
+    "                if (p.flags & 16u) {\n"
+    "                    mr = uint(clamp(int(a.ra + (a.rb - a.ra) * t), 0, 31));\n"
+    "                    mg = uint(clamp(int(a.ga + (a.gb - a.ga) * t), 0, 31));\n"
+    "                    mb = uint(clamp(int(a.ba + (a.bb - a.ba) * t), 0, 31));\n"
+    "                }\n"
+    "            } else if (p.kind == 1u) {\n"
     "                u = (p.u + col / p.w) & 0xFF;\n"
     "                v = (p.v + line / p.w) & 0xFF;\n"
     "            } else {\n"
@@ -152,9 +179,9 @@ static NSString *const batch_shader =
     "            if (p.color >> 24) {\n"
     "                result = t & 0x7FFFu;\n"
     "            } else {\n"
-    "                uint r = min(((t & 31u) * (p.color & 0xFFu)) >> 4, 31u);\n"
-    "                uint g = min((((t >> 5) & 31u) * ((p.color >> 8) & 0xFFu)) >> 4, 31u);\n"
-    "                uint b = min((((t >> 10) & 31u) * ((p.color >> 16) & 0xFFu)) >> 4, 31u);\n"
+    "                uint r = min(((t & 31u) * mr) >> 4, 31u);\n"
+    "                uint g = min((((t >> 5) & 31u) * mg) >> 4, 31u);\n"
+    "                uint b = min((((t >> 10) & 31u) * mb) >> 4, 31u);\n"
     "                result = r | (g << 5) | (b << 10);\n"
     "            }\n"
     "            semi = (t & 0x8000u) != 0u;\n"
@@ -334,7 +361,7 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
                          const PsxMetalPrimitive *primitives,
                          uint32_t primitive_count,
                          const PsxMetalEntry *entries, uint32_t entry_count,
-                         const PsxMetalRowAttr *attrs, uint32_t attr_count,
+                         const uint32_t *attrs, uint32_t attr_count,
                          unsigned char *dirty_rows) {
     @autoreleasepool {
         if (!entry_count || rows <= 0 || !initialize()) return 0;
@@ -342,10 +369,15 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
         uint32_t *row_counts = calloc((size_t)rows + 1u, sizeof *row_counts);
         if (!row_counts) return 0;
         for (uint32_t i = 0; i < entry_count; ++i) {
+            uint32_t words = 0;
+            if (entries[i].primitive < primitive_count) {
+                const uint32_t kind = primitives[entries[i].primitive].kind;
+                words = kind == PSX_METAL_GOURAUD ? sizeof(PsxMetalRowAttr) / 4u
+                      : kind == PSX_METAL_TEX_TRIANGLE ? sizeof(PsxMetalTexAttr) / 4u : 0u;
+            }
             if (entries[i].row >= (uint32_t)rows ||
                 entries[i].primitive >= primitive_count ||
-                (primitives[entries[i].primitive].kind == PSX_METAL_GOURAUD &&
-                 entries[i].attr >= attr_count)) {
+                (words && (entries[i].attr > attr_count || attr_count - entries[i].attr < words))) {
                 free(row_counts);
                 return 0;
             }
@@ -438,11 +470,11 @@ int psx_metal_draw_batch(uint16_t *buf, int pitch, int rows,
         }
         [encoder setBuffer:(texels ? texels : batch_dirty) offset:0 atIndex:5];
         if (attr_count) {
-            if (!reserve(&batch_attrs, attr_count * sizeof(PsxMetalRowAttr))) {
+            if (!reserve(&batch_attrs, attr_count * sizeof(uint32_t))) {
                 free(row_of);
                 return 0;
             }
-            memcpy(batch_attrs.contents, attrs, attr_count * sizeof(PsxMetalRowAttr));
+            memcpy(batch_attrs.contents, attrs, attr_count * sizeof(uint32_t));
         }
         [encoder setBuffer:(attr_count ? batch_attrs : batch_dirty) offset:0 atIndex:6];
         [encoder dispatchThreads:MTLSizeMake(max_width, row_count, 1)

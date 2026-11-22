@@ -476,6 +476,136 @@ static void sw_tri_uv_limits(const int *xs, const int *ys,
     else psx_uv_tri_limits(xs, ys, us, vs, g_uv_lim);
 }
 
+/* One scanline of a textured triangle: the unclipped left edge, the span
+ * the per-pixel parameter divides by (at least 1) and the edge values of
+ * every interpolated quantity. The CPU rasterizers and the Metal batch both
+ * start from these float results. Layout matches PsxMetalTexAttr. */
+typedef struct {
+    int32_t xa, span;
+    float ua, ub, va, vb, qa, qb, uqa, uqb, vqa, vqb, ra, rb, ga, gb, ba, bb;
+} TexRow;
+
+/* Vertices sorted by y, with uv, 5-bit modulation colours and q. */
+typedef struct {
+    int x[3], y[3], u[3], v[3], r[3], g[3], b[3];
+    float q[3];
+} TexVerts;
+
+static void tex_swap(TexVerts *v, int i, int j) {
+    int tt;
+    tt = v->x[i]; v->x[i] = v->x[j]; v->x[j] = tt;
+    tt = v->y[i]; v->y[i] = v->y[j]; v->y[j] = tt;
+    tt = v->u[i]; v->u[i] = v->u[j]; v->u[j] = tt;
+    tt = v->v[i]; v->v[i] = v->v[j]; v->v[j] = tt;
+    tt = v->r[i]; v->r[i] = v->r[j]; v->r[j] = tt;
+    tt = v->g[i]; v->g[i] = v->g[j]; v->g[j] = tt;
+    tt = v->b[i]; v->b[i] = v->b[j]; v->b[j] = tt;
+    float tq = v->q[i]; v->q[i] = v->q[j]; v->q[j] = tq;
+}
+
+/* Sorts by y, keeping every attribute in sync. Returns 0 for zero height. */
+static int tex_sort(TexVerts *v) {
+    if (v->y[0] > v->y[1]) tex_swap(v, 0, 1);
+    if (v->y[0] > v->y[2]) tex_swap(v, 0, 2);
+    if (v->y[1] > v->y[2]) tex_swap(v, 1, 2);
+    return v->y[2] - v->y[0] != 0;
+}
+
+/* Row y of a sorted triangle; *xb receives the unclipped right edge. */
+static TexRow tex_row(const TexVerts *v, int y, int *xb_out) {
+    const int x0 = v->x[0], y0 = v->y[0], x1 = v->x[1], y1 = v->y[1];
+    const int x2 = v->x[2], y2 = v->y[2];
+    const int u0 = v->u[0], u1 = v->u[1], u2 = v->u[2];
+    const int v0 = v->v[0], v1 = v->v[1], v2 = v->v[2];
+    const int r0 = v->r[0], r1 = v->r[1], r2 = v->r[2];
+    const int g0 = v->g[0], g1 = v->g[1], g2 = v->g[2];
+    const int b0 = v->b[0], b1 = v->b[1], b2 = v->b[2];
+    const float q0 = v->q[0], q1 = v->q[1], q2 = v->q[2];
+    const int dy_total = y2 - y0;
+    int second_half = (y >= y1);
+    int seg_height = second_half ? (y2 - y1) : (y1 - y0);
+    if (seg_height == 0) seg_height = 1;
+
+    float alpha = (float)(y - y0) / (float)dy_total;
+    float beta;
+    if (second_half)
+        beta = (float)(y - y1) / (float)seg_height;
+    else
+        beta = (float)(y - y0) / (float)seg_height;
+
+    int xa, xb;
+    psx_triangle_edges_at_y(x0, y0, x1, y1, x2, y2, y, &xa, &xb);
+
+    float ua = u0 + (float)(u2 - u0) * alpha;
+    float va = v0 + (float)(v2 - v0) * alpha;
+    float qa = q0 + (q2 - q0) * alpha;
+    float uqa = (float)u0 * q0 + ((float)u2 * q2 - (float)u0 * q0) * alpha;
+    float vqa = (float)v0 * q0 + ((float)v2 * q2 - (float)v0 * q0) * alpha;
+    float ra = r0 + (float)(r2 - r0) * alpha;
+    float ga = g0 + (float)(g2 - g0) * alpha;
+    float ba = b0 + (float)(b2 - b0) * alpha;
+
+    float ub, vb, qb, uqb, vqb, rb, gb, bb;
+    if (second_half) {
+        ub = u1 + (float)(u2 - u1) * beta;
+        vb = v1 + (float)(v2 - v1) * beta;
+        qb = q1 + (q2 - q1) * beta;
+        uqb = (float)u1 * q1 + ((float)u2 * q2 - (float)u1 * q1) * beta;
+        vqb = (float)v1 * q1 + ((float)v2 * q2 - (float)v1 * q1) * beta;
+        rb = r1 + (float)(r2 - r1) * beta;
+        gb = g1 + (float)(g2 - g1) * beta;
+        bb = b1 + (float)(b2 - b1) * beta;
+    } else {
+        ub = u0 + (float)(u1 - u0) * beta;
+        vb = v0 + (float)(v1 - v0) * beta;
+        qb = q0 + (q1 - q0) * beta;
+        uqb = (float)u0 * q0 + ((float)u1 * q1 - (float)u0 * q0) * beta;
+        vqb = (float)v0 * q0 + ((float)v1 * q1 - (float)v0 * q0) * beta;
+        rb = r0 + (float)(r1 - r0) * beta;
+        gb = g0 + (float)(g1 - g0) * beta;
+        bb = b0 + (float)(b1 - b0) * beta;
+    }
+
+    if (xa > xb) {
+        int tt = xa; xa = xb; xb = tt;
+        float tf;
+        tf = ua; ua = ub; ub = tf;
+        tf = va; va = vb; vb = tf;
+        tf = qa; qa = qb; qb = tf;
+        tf = uqa; uqa = uqb; uqb = tf;
+        tf = vqa; vqa = vqb; vqb = tf;
+        tf = ra; ra = rb; rb = tf;
+        tf = ga; ga = gb; gb = tf;
+        tf = ba; ba = bb; bb = tf;
+    }
+    *xb_out = xb;
+    const int span = xb - xa;
+    return (TexRow){xa, span == 0 ? 1 : span, ua, ub, va, vb, qa, qb, uqa, uqb, vqa, vqb,
+                    ra, rb, ga, gb, ba, bb};
+}
+
+/* Texture coordinates at pixel x of a row; returns the row parameter. */
+static inline float tex_uv(const TexRow *a, int x, int perspective, float *fu, float *fv) {
+    float t_val = (float)(x - a->xa) / (float)a->span;
+    *fu = a->ua + (a->ub - a->ua) * t_val;
+    *fv = a->va + (a->vb - a->va) * t_val;
+    if (perspective) {
+        float q = a->qa + (a->qb - a->qa) * t_val;
+        if (q > 1.0e-12f) {
+            *fu = (a->uqa + (a->uqb - a->uqa) * t_val) / q;
+            *fv = (a->vqa + (a->vqb - a->vqa) * t_val) / q;
+        }
+    }
+    return t_val;
+}
+
+/* The shaded modulation colours at row parameter t_val. */
+static inline void tex_shade(const TexRow *a, float t_val, int *mr, int *mg, int *mb) {
+    *mr = clamp_i((int)(a->ra + (a->rb - a->ra) * t_val), 0, 31);
+    *mg = clamp_i((int)(a->ga + (a->gb - a->ga) * t_val), 0, 31);
+    *mb = clamp_i((int)(a->ba + (a->bb - a->ba) * t_val), 0, 31);
+}
+
 static void sw_rect_uv_limits(int u0, int v0, int u1, int v1) {
     psx_uv_rect_limits(u0, v0, u1, v1, g_uv_lim);
 }
@@ -822,9 +952,10 @@ typedef struct {
     uint32_t primitive_count, primitive_capacity;
     PsxMetalEntry *entries;
     uint32_t entry_count, entry_capacity;
-    PsxMetalRowAttr *attrs;
+    uint32_t *attrs;               /* row attribute words */
     uint32_t attr_count, attr_capacity;
 } MetalBatch;
+_Static_assert(sizeof(TexRow) == sizeof(PsxMetalTexAttr), "TexRow matches PsxMetalTexAttr");
 static MetalBatch g_metal_batches[METAL_BATCH_TARGETS];
 static int g_metal_batch_depth;
 static uint64_t g_metal_hazard_flushes, g_metal_self_hazards;
@@ -922,7 +1053,9 @@ static void metal_batch_apply_cpu(const MetalBatch *b, unsigned char *dirty) {
             if (p->kind == PSX_METAL_FLAT) {
                 result = (uint16_t)p->color;
             } else if (p->kind == PSX_METAL_GOURAUD) {
-                const PsxMetalRowAttr *a = &b->attrs[e.attr];
+                PsxMetalRowAttr attr;
+                memcpy(&attr, b->attrs + e.attr, sizeof attr);
+                const PsxMetalRowAttr *a = &attr;
                 if (a->span > 0) {
                     float tf = (float)((int)x - a->xa) / (float)a->span;
                     int r = a->ra + (int)((float)(a->rb - a->ra) * tf);
@@ -936,7 +1069,18 @@ static void metal_batch_apply_cpu(const MetalBatch *b, unsigned char *dirty) {
             } else {
                 const int col = (int)x - p->x, line = (int)e.row - p->y;
                 int u, v;
-                if (p->kind == PSX_METAL_SPRITE) {
+                int mr = (int)(p->color & 0xFF), mg = (int)((p->color >> 8) & 0xFF);
+                int mb = (int)((p->color >> 16) & 0xFF);
+                if (p->kind == PSX_METAL_TEX_TRIANGLE) {
+                    TexRow a;
+                    memcpy(&a, b->attrs + e.attr, sizeof a);
+                    float fu, fv;
+                    const float t_val = tex_uv(&a, (int)x, (p->flags & PSX_METAL_PERSPECTIVE) != 0,
+                                               &fu, &fv);
+                    u = (int)fu & 0xFF;
+                    v = (int)fv & 0xFF;
+                    if (p->flags & PSX_METAL_SHADED) tex_shade(&a, t_val, &mr, &mg, &mb);
+                } else if (p->kind == PSX_METAL_SPRITE) {
                     u = (p->u + col / p->w) & 0xFF;
                     v = (p->v + line / p->w) & 0xFF;
                 } else {
@@ -948,9 +1092,9 @@ static void metal_batch_apply_cpu(const MetalBatch *b, unsigned char *dirty) {
                 if (p->color >> 24) {
                     result = texel & 0x7FFF;
                 } else {
-                    const int r = min_i(((texel & 31) * (int)(p->color & 0xFF)) >> 4, 31);
-                    const int g = min_i((((texel >> 5) & 31) * (int)((p->color >> 8) & 0xFF)) >> 4, 31);
-                    const int bl = min_i((((texel >> 10) & 31) * (int)((p->color >> 16) & 0xFF)) >> 4, 31);
+                    const int r = min_i(((texel & 31) * mr) >> 4, 31);
+                    const int g = min_i((((texel >> 5) & 31) * mg) >> 4, 31);
+                    const int bl = min_i((((texel >> 10) & 31) * mb) >> 4, 31);
                     result = (uint16_t)(r | (g << 5) | (bl << 10));
                 }
                 semi = (texel & 0x8000) != 0;
@@ -1032,12 +1176,13 @@ static PsxMetalPrimitive metal_primitive(const RTarget *t, uint32_t kind, uint32
 }
 
 /* Queues one primitive's spans on t. reads, when non-NULL, is the native
- * VRAM it samples; attrs, when non-NULL, holds one row attribute per span.
+ * VRAM it samples; attrs, when non-NULL, holds one row attribute of
+ * attr_words 32-bit words per span.
  * Returns 0 when it must draw on the CPU instead; any open batch has then
  * been applied. */
 static int metal_enqueue(const RTarget *t, const PsxMetalSpan *spans, int top, int height,
                          const PsxMetalPrimitive *primitive, const MetalTiles *reads,
-                         const PsxMetalRowAttr *attrs) {
+                         const void *attrs, uint32_t attr_words) {
     MetalTiles writes;
     memset(&writes, 0, sizeof writes);
     if (t->buf == g_vram) {
@@ -1082,7 +1227,8 @@ static int metal_enqueue(const RTarget *t, const PsxMetalSpan *spans, int top, i
         !metal_grow((void **)&b->entries, &b->entry_capacity,
                     b->entry_count + (uint32_t)height, sizeof *b->entries) ||
         (attrs && !metal_grow((void **)&b->attrs, &b->attr_capacity,
-                              b->attr_count + (uint32_t)height, sizeof *b->attrs))) {
+                              b->attr_count + (uint32_t)height * attr_words,
+                              sizeof *b->attrs))) {
         sw_metal_batch_sync();
         return 0;
     }
@@ -1092,8 +1238,10 @@ static int metal_enqueue(const RTarget *t, const PsxMetalSpan *spans, int top, i
         if (spans[y].width) {
             uint32_t attr = 0;
             if (attrs) {
-                attr = b->attr_count++;
-                b->attrs[attr] = attrs[y];
+                attr = b->attr_count;
+                memcpy(b->attrs + attr, (const uint32_t *)attrs + (size_t)y * attr_words,
+                       attr_words * sizeof(uint32_t));
+                b->attr_count += attr_words;
             }
             b->entries[b->entry_count++] =
                 (PsxMetalEntry){(uint32_t)(top + y), spans[y].x, spans[y].width, index, attr};
@@ -1117,7 +1265,7 @@ static int metal_sprite(const RTarget *t, const PsxMetalPrimitive *p, int x, int
     PsxMetalPrimitive placed = *p;
     placed.x = x;
     placed.y = y;
-    return metal_enqueue(t, spans, top, bottom - top, &placed, reads, NULL);
+    return metal_enqueue(t, spans, top, bottom - top, &placed, reads, NULL, 0);
 }
 
 /* Batches a textured rectangle on every target, or returns 0 after applying
@@ -1176,7 +1324,7 @@ static int metal_draw(const RTarget *t, const PsxMetalSpan *spans,
                       int top, int height, uint16_t color) {
     if (g_metal_batch_depth) {
         const PsxMetalPrimitive p = metal_primitive(t, PSX_METAL_FLAT, color);
-        if (metal_enqueue(t, spans, top, height, &p, NULL, NULL)) return 1;
+        if (metal_enqueue(t, spans, top, height, &p, NULL, NULL, 0)) return 1;
     }
     uint16_t *rows = t->buf + (size_t)top * t->w;
     unsigned char dirty[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
@@ -1447,7 +1595,8 @@ static int metal_gouraud(const RTarget *t, int x0, int y0, uint16_t c0, int x1, 
                                            row.rb, row.gb, row.bb};
     }
     const PsxMetalPrimitive p = metal_primitive(t, PSX_METAL_GOURAUD, 0);
-    return metal_enqueue(t, spans, top, bottom - top, &p, NULL, attrs);
+    return metal_enqueue(t, spans, top, bottom - top, &p, NULL, attrs,
+                         sizeof *attrs / sizeof(uint32_t));
 }
 #endif
 
@@ -1501,160 +1650,34 @@ void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
 /* Textured triangle                                                  */
 /* ------------------------------------------------------------------ */
 
-static void raster_textured_triangle(const RTarget *t,
-                                     int x0, int y0, int u0, int v0,
-                                     int x1, int y1, int u1, int v1,
-                                     int x2, int y2, int u2, int v2,
-                                     uint16_t clut_x, uint16_t clut_y,
-                                     uint16_t texpage,
-                                     int perspective,
-                                     float q0, float q1, float q2) {
-    /* Sort by Y, keeping UV in sync */
-    if (y0 > y1) {
-        int tt;
-        tt=x0; x0=x1; x1=tt; tt=y0; y0=y1; y1=tt;
-        tt=u0; u0=u1; u1=tt; tt=v0; v0=v1; v1=tt;
-        float tq=q0; q0=q1; q1=tq;
-    }
-    if (y0 > y2) {
-        int tt;
-        tt=x0; x0=x2; x2=tt; tt=y0; y0=y2; y2=tt;
-        tt=u0; u0=u2; u2=tt; tt=v0; v0=v2; v2=tt;
-        float tq=q0; q0=q2; q2=tq;
-    }
-    if (y1 > y2) {
-        int tt;
-        tt=x1; x1=x2; x2=tt; tt=y1; y1=y2; y2=tt;
-        tt=u1; u1=u2; u2=tt; tt=v1; v1=v2; v2=tt;
-        float tq=q1; q1=q2; q2=tq;
-    }
-
-    int dy_total = y2 - y0;
-    if (dy_total == 0) return;
-
-    for (int y = y0; y < y2; y++) {
+/* Rasterizes a sorted textured triangle. shaded selects per-pixel
+ * modulation from the vertex colours; otherwise the current modulation. */
+static void raster_tex_triangle(const RTarget *t, const TexVerts *v, int shaded,
+                                uint16_t clut_x, uint16_t clut_y, uint16_t texpage,
+                                int raw_texture, int perspective) {
+    for (int y = v->y[0]; y < v->y[2]; y++) {
         if (y < t->cy1 || y > t->cy2) continue;
-
-        int second_half = (y >= y1);
-        int seg_height = second_half ? (y2 - y1) : (y1 - y0);
-        if (seg_height == 0) seg_height = 1;
-
-        float alpha = (float)(y - y0) / (float)dy_total;
-        float beta;
-        if (second_half)
-            beta = (float)(y - y1) / (float)seg_height;
-        else
-            beta = (float)(y - y0) / (float)seg_height;
-
-        int xa, xb;
-        psx_triangle_edges_at_y(x0, y0, x1, y1, x2, y2, y, &xa, &xb);
-
-        float ua = u0 + (float)(u2 - u0) * alpha;
-        float va = v0 + (float)(v2 - v0) * alpha;
-        float qa = q0 + (q2 - q0) * alpha;
-        float uqa = (float)u0 * q0 + ((float)u2 * q2 - (float)u0 * q0) * alpha;
-        float vqa = (float)v0 * q0 + ((float)v2 * q2 - (float)v0 * q0) * alpha;
-        float ub, vb;
-        float qb, uqb, vqb;
-        if (second_half) {
-            ub = u1 + (float)(u2 - u1) * beta;
-            vb = v1 + (float)(v2 - v1) * beta;
-            qb = q1 + (q2 - q1) * beta;
-            uqb = (float)u1 * q1 + ((float)u2 * q2 - (float)u1 * q1) * beta;
-            vqb = (float)v1 * q1 + ((float)v2 * q2 - (float)v1 * q1) * beta;
-        } else {
-            ub = u0 + (float)(u1 - u0) * beta;
-            vb = v0 + (float)(v1 - v0) * beta;
-            qb = q0 + (q1 - q0) * beta;
-            uqb = (float)u0 * q0 + ((float)u1 * q1 - (float)u0 * q0) * beta;
-            vqb = (float)v0 * q0 + ((float)v1 * q1 - (float)v0 * q0) * beta;
-        }
-
-        if (xa > xb) {
-            int tt = xa; xa = xb; xb = tt;
-            float tf;
-            tf = ua; ua = ub; ub = tf;
-            tf = va; va = vb; vb = tf;
-            tf = qa; qa = qb; qb = tf;
-            tf = uqa; uqa = uqb; uqb = tf;
-            tf = vqa; vqa = vqb; vqb = tf;
-        }
-
-        int span = xb - xa;
-        if (span == 0) span = 1;
-
-        int sx = max_i(xa, t->cx1);
+        int xb;
+        const TexRow row = tex_row(v, y, &xb);
+        int sx = max_i(row.xa, t->cx1);
         int ex = min_i(xb, t->cx2 + 1);
 
         for (int x = sx; x < ex; x++) {
-            float t_val = (float)(x - xa) / (float)span;
-            float fu = ua + (ub - ua) * t_val;
-            float fv = va + (vb - va) * t_val;
-            if (perspective) {
-                float q = qa + (qb - qa) * t_val;
-                if (q > 1.0e-12f) {
-                    fu = (uqa + (uqb - uqa) * t_val) / q;
-                    fv = (vqa + (vqb - vqa) * t_val) / q;
-                }
-            }
+            float fu, fv;
+            const float t_val = tex_uv(&row, x, perspective, &fu, &fv);
+            int mr = g_mod_r, mg = g_mod_g, mb = g_mod_b;
+            if (shaded) tex_shade(&row, t_val, &mr, &mg, &mb);
 
+            uint16_t texel;
             if (g_texture_filter) {
                 float sh = bilinear_center_shift_for_target(t);
-                uint16_t texel = texel_fetch_bilinear(fu + sh, fv + sh,
-                                                      texpage, clut_x, clut_y);
-                put_textured(t, x, y, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
+                texel = texel_fetch_bilinear(fu + sh, fv + sh, texpage, clut_x, clut_y);
             } else {
-                uint16_t texel = texel_fetch((int)fu & 0xFF, (int)fv & 0xFF,
-                                             texpage, clut_x, clut_y);
-                put_textured(t, x, y, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
+                texel = texel_fetch((int)fu & 0xFF, (int)fv & 0xFF, texpage, clut_x, clut_y);
             }
+            put_textured(t, x, y, texel, mr, mg, mb, raw_texture);
         }
     }
-}
-
-void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
-                               int x1, int y1, int u1, int v1,
-                               int x2, int y2, int u2, int v2,
-                               uint16_t clut_x, uint16_t clut_y,
-                               uint16_t texpage) {
-    METAL_BATCH_SYNC();
-    int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
-                  - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
-    if (area2 == 0) { precise_consumed(); return; }
-
-    if (g_texture_filter) {
-        int xs[3] = {x0,x1,x2}, ys[3] = {y0,y1,y2};
-        int us[3] = {u0,u1,u2}, vs[3] = {v0,v1,v2};
-        sw_tri_uv_limits(xs, ys, us, vs);
-    }
-
-    RTarget n = rt_native();
-    raster_textured_triangle(&n, x0, y0, u0, v0, x1, y1, u1, v1,
-                             x2, y2, u2, v2, clut_x, clut_y, texpage,
-                             g_perspective_valid,
-                             g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
-    if (g_hr) {
-        int s = g_scale;
-        RTarget hr = rt_hires();
-        raster_textured_triangle(&hr,
-                                 precise_scaled(0,0,x0,s), precise_scaled(1,0,y0,s), u0, v0,
-                                 precise_scaled(0,1,x1,s), precise_scaled(1,1,y1,s), u1, v1,
-                                 precise_scaled(0,2,x2,s), precise_scaled(1,2,y2,s), u2, v2,
-                                 clut_x, clut_y, texpage, g_perspective_valid,
-                                 g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
-    }
-    if (g_wide_cur) {
-        int s = g_scale, dx = wide_dx();
-        RTarget wt = rt_wide();
-        WideBd bd = wide_bd_get();
-        raster_textured_triangle(&wt,
-                                 precise_wide_x(0,x0,s,dx,&bd), precise_scaled(1,0,y0,s), u0, v0,
-                                 precise_wide_x(1,x1,s,dx,&bd), precise_scaled(1,1,y1,s), u1, v1,
-                                 precise_wide_x(2,x2,s,dx,&bd), precise_scaled(1,2,y2,s), u2, v2,
-                                 clut_x, clut_y, texpage, g_perspective_valid,
-                                 g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
-    }
-    precise_consumed();
 }
 
 static inline void color24_to_mod(uint32_t color, int *r, int *g, int *b) {
@@ -1663,139 +1686,152 @@ static inline void color24_to_mod(uint32_t color, int *r, int *g, int *b) {
     *b = (int)((color >> 16) & 0xFF) >> 3;
 }
 
-static void raster_shaded_textured_triangle(const RTarget *t,
-                                            int x0, int y0, int u0, int v0,
-                                            int r0, int g0, int b0,
-                                            int x1, int y1, int u1, int v1,
-                                            int r1, int g1, int b1,
-                                            int x2, int y2, int u2, int v2,
-                                            int r2, int g2, int b2,
-                                            uint16_t clut_x, uint16_t clut_y,
-                                            uint16_t texpage, int raw_texture,
-                                            int perspective,
-                                            float q0, float q1, float q2) {
-    /* Sort by Y, keeping UV and color modulation in sync */
-    if (y0 > y1) {
-        int tt;
-        tt=x0; x0=x1; x1=tt; tt=y0; y0=y1; y1=tt;
-        tt=u0; u0=u1; u1=tt; tt=v0; v0=v1; v1=tt;
-        tt=r0; r0=r1; r1=tt; tt=g0; g0=g1; g1=tt; tt=b0; b0=b1; b1=tt;
-        float tq=q0; q0=q1; q1=tq;
+/* Vertices of a textured triangle on a target; coordinates are already in
+ * the target's pixel space. */
+static TexVerts tex_verts(const int *xs, const int *ys, const int *us, const int *vs,
+                          const uint32_t *colors) {
+    TexVerts v;
+    for (int i = 0; i < 3; ++i) {
+        v.x[i] = xs[i]; v.y[i] = ys[i]; v.u[i] = us[i]; v.v[i] = vs[i];
+        v.q[i] = g_perspective_q[i];
+        if (colors) color24_to_mod(colors[i], &v.r[i], &v.g[i], &v.b[i]);
+        else v.r[i] = v.g[i] = v.b[i] = 0;
     }
-    if (y0 > y2) {
-        int tt;
-        tt=x0; x0=x2; x2=tt; tt=y0; y0=y2; y2=tt;
-        tt=u0; u0=u2; u2=tt; tt=v0; v0=v2; v2=tt;
-        tt=r0; r0=r2; r2=tt; tt=g0; g0=g2; g2=tt; tt=b0; b0=b2; b2=tt;
-        float tq=q0; q0=q2; q2=tq;
+    return v;
+}
+
+#ifdef PSX_MACOS_METAL_RASTERIZER
+/* Queues one sorted textured triangle on t with the CPU rasterizer's rows. */
+static int metal_tex_triangle(const RTarget *t, const TexVerts *v, const PsxMetalPrimitive *p,
+                              const MetalTiles *reads) {
+    const int top = max_i(v->y[0], max_i(t->cy1, 0));
+    const int bottom = min_i(v->y[2], min_i(t->cy2 + 1, t->h));
+    if (bottom <= top) return 1;
+    static PsxMetalSpan spans[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
+    static TexRow rows[VRAM_HEIGHT * SW_MAX_INTERNAL_SCALE];
+    for (int y = top; y < bottom; ++y) {
+        int xb;
+        rows[y - top] = tex_row(v, y, &xb);
+        const int sx = max_i(max_i(rows[y - top].xa, t->cx1), 0);
+        const int ex = min_i(min_i(xb, t->cx2 + 1), t->w);
+        spans[y - top] = ex > sx ? (PsxMetalSpan){(uint32_t)sx, (uint32_t)(ex - sx)}
+                                 : (PsxMetalSpan){0, 0};
     }
-    if (y1 > y2) {
-        int tt;
-        tt=x1; x1=x2; x2=tt; tt=y1; y1=y2; y2=tt;
-        tt=u1; u1=u2; u2=tt; tt=v1; v1=v2; v2=tt;
-        tt=r1; r1=r2; r2=tt; tt=g1; g1=g2; g2=tt; tt=b1; b1=b2; b2=tt;
-        float tq=q1; q1=q2; q2=tq;
-    }
+    PsxMetalPrimitive placed = *p;
+    PsxMetalPrimitive q = metal_primitive(t, PSX_METAL_TEX_TRIANGLE, p->color);
+    placed.flags = q.flags | (p->flags & (PSX_METAL_PERSPECTIVE | PSX_METAL_SHADED));
+    return metal_enqueue(t, spans, top, bottom - top, &placed, reads, rows,
+                         sizeof *rows / sizeof(uint32_t));
+}
 
-    int dy_total = y2 - y0;
-    if (dy_total == 0) return;
-
-    for (int y = y0; y < y2; y++) {
-        if (y < t->cy1 || y > t->cy2) continue;
-
-        int second_half = (y >= y1);
-        int seg_height = second_half ? (y2 - y1) : (y1 - y0);
-        if (seg_height == 0) seg_height = 1;
-
-        float alpha = (float)(y - y0) / (float)dy_total;
-        float beta;
-        if (second_half)
-            beta = (float)(y - y1) / (float)seg_height;
-        else
-            beta = (float)(y - y0) / (float)seg_height;
-
-        int xa, xb;
-        psx_triangle_edges_at_y(x0, y0, x1, y1, x2, y2, y, &xa, &xb);
-
-        float ua = u0 + (float)(u2 - u0) * alpha;
-        float va = v0 + (float)(v2 - v0) * alpha;
-        float qa = q0 + (q2 - q0) * alpha;
-        float uqa = (float)u0 * q0 + ((float)u2 * q2 - (float)u0 * q0) * alpha;
-        float vqa = (float)v0 * q0 + ((float)v2 * q2 - (float)v0 * q0) * alpha;
-        float ra = r0 + (float)(r2 - r0) * alpha;
-        float ga = g0 + (float)(g2 - g0) * alpha;
-        float ba = b0 + (float)(b2 - b0) * alpha;
-
-        float ub, vb, qb, uqb, vqb, rb, gb, bb;
-        if (second_half) {
-            ub = u1 + (float)(u2 - u1) * beta;
-            vb = v1 + (float)(v2 - v1) * beta;
-            qb = q1 + (q2 - q1) * beta;
-            uqb = (float)u1 * q1 + ((float)u2 * q2 - (float)u1 * q1) * beta;
-            vqb = (float)v1 * q1 + ((float)v2 * q2 - (float)v1 * q1) * beta;
-            rb = r1 + (float)(r2 - r1) * beta;
-            gb = g1 + (float)(g2 - g1) * beta;
-            bb = b1 + (float)(b2 - b1) * beta;
-        } else {
-            ub = u0 + (float)(u1 - u0) * beta;
-            vb = v0 + (float)(v1 - v0) * beta;
-            qb = q0 + (q1 - q0) * beta;
-            uqb = (float)u0 * q0 + ((float)u1 * q1 - (float)u0 * q0) * beta;
-            vqb = (float)v0 * q0 + ((float)v1 * q1 - (float)v0 * q0) * beta;
-            rb = r0 + (float)(r1 - r0) * beta;
-            gb = g0 + (float)(g1 - g0) * beta;
-            bb = b0 + (float)(b1 - b0) * beta;
+/* Batches a textured triangle on the native target and the mirror, or
+ * returns 0 after applying any open batch so the caller draws it on the CPU.
+ * Bilinear filtering and the wide compositor stay on the CPU. */
+static int metal_textured_triangle(const int *xs, const int *ys, const int *us, const int *vs,
+                                   const uint32_t *colors, uint16_t clut_x, uint16_t clut_y,
+                                   uint16_t texpage, int raw_texture) {
+    if (!g_metal_batch_depth || g_texture_filter || g_wide_cur) return 0;
+    /* Pixels interpolate uv inside the vertices' range; float rounding can
+     * truncate one texel below it. sw_set_perspective_triangle accepts only
+     * positive q, so perspective division keeps the same bounds. */
+    MetalTiles reads;
+    memset(&reads, 0, sizeof reads);
+    const int u0 = min_i(us[0], min_i(us[1], us[2])), u1 = max_i(us[0], max_i(us[1], us[2]));
+    const int v0 = min_i(vs[0], min_i(vs[1], vs[2])), v1 = max_i(vs[0], max_i(vs[1], vs[2]));
+    tiles_add_texture(&reads, texpage, clut_x, clut_y, max_i(u0 - 1, 0), max_i(v0 - 1, 0),
+                      min_i(u1 + 1, 255), min_i(v1 + 1, 255));
+    RTarget n = rt_native();
+    PsxMetalPrimitive p = metal_primitive(&n, PSX_METAL_TEX_TRIANGLE,
+        colors ? (uint32_t)(raw_texture ? 1 : 0) << 24
+               : (uint32_t)g_mod_r | (uint32_t)g_mod_g << 8 | (uint32_t)g_mod_b << 16 |
+                 (uint32_t)(raw_texture ? 1 : 0) << 24);
+    p.texpage = texpage;
+    p.clut = (uint32_t)clut_x | (uint32_t)clut_y << 16;
+    p.window = (uint32_t)g_tw_mask_x | (uint32_t)g_tw_mask_y << 8 |
+               (uint32_t)g_tw_off_x << 16 | (uint32_t)g_tw_off_y << 24;
+    p.flags = (g_perspective_valid ? PSX_METAL_PERSPECTIVE : 0) |
+              (colors ? PSX_METAL_SHADED : 0);
+    TexVerts v = tex_verts(xs, ys, us, vs, colors);
+    if (tex_sort(&v) && !metal_tex_triangle(&n, &v, &p, &reads)) return 0;
+    if (g_hr) {
+        const int s = g_scale;
+        RTarget hr = rt_hires();
+        int hx[3], hy[3];
+        for (int i = 0; i < 3; ++i) {
+            hx[i] = precise_scaled(0, i, xs[i], s);
+            hy[i] = precise_scaled(1, i, ys[i], s);
         }
-
-        if (xa > xb) {
-            int tt = xa; xa = xb; xb = tt;
-            float tf;
-            tf = ua; ua = ub; ub = tf;
-            tf = va; va = vb; vb = tf;
-            tf = qa; qa = qb; qb = tf;
-            tf = uqa; uqa = uqb; uqb = tf;
-            tf = vqa; vqa = vqb; vqb = tf;
-            tf = ra; ra = rb; rb = tf;
-            tf = ga; ga = gb; gb = tf;
-            tf = ba; ba = bb; bb = tf;
-        }
-
-        int span = xb - xa;
-        if (span == 0) span = 1;
-
-        int sx = max_i(xa, t->cx1);
-        int ex = min_i(xb, t->cx2 + 1);
-
-        for (int x = sx; x < ex; x++) {
-            float t_val = (float)(x - xa) / (float)span;
-            float fu = ua + (ub - ua) * t_val;
-            float fv = va + (vb - va) * t_val;
-            if (perspective) {
-                float q = qa + (qb - qa) * t_val;
-                if (q > 1.0e-12f) {
-                    fu = (uqa + (uqb - uqa) * t_val) / q;
-                    fv = (vqa + (vqb - vqa) * t_val) / q;
-                }
-            }
-            int mr = (int)(ra + (rb - ra) * t_val);
-            int mg = (int)(ga + (gb - ga) * t_val);
-            int mb = (int)(ba + (bb - ba) * t_val);
-            if (mr < 0) mr = 0; if (mr > 31) mr = 31;
-            if (mg < 0) mg = 0; if (mg > 31) mg = 31;
-            if (mb < 0) mb = 0; if (mb > 31) mb = 31;
-
-            if (g_texture_filter) {
-                float sh = bilinear_center_shift_for_target(t);
-                uint16_t texel = texel_fetch_bilinear(fu + sh, fv + sh,
-                                                      texpage, clut_x, clut_y);
-                put_textured(t, x, y, texel, mr, mg, mb, raw_texture);
-            } else {
-                uint16_t texel = texel_fetch((int)fu & 0xFF, (int)fv & 0xFF,
-                                             texpage, clut_x, clut_y);
-                put_textured(t, x, y, texel, mr, mg, mb, raw_texture);
-            }
-        }
+        TexVerts h = tex_verts(hx, hy, us, vs, colors);
+        /* The native half is queued; if the mirror cannot be, the batch is
+         * applied and the mirror draws on the CPU, the same order. */
+        if (tex_sort(&h) && !metal_tex_triangle(&hr, &h, &p, &reads))
+            raster_tex_triangle(&hr, &h, colors != NULL, clut_x, clut_y, texpage, raw_texture,
+                                g_perspective_valid);
     }
+    return 1;
+}
+#endif
+
+/* Draws a textured triangle on every target; colors, when non-NULL, are the
+ * three 24-bit vertex colours of a shaded triangle. */
+static void draw_textured_triangle(const int *xs, const int *ys, const int *us, const int *vs,
+                                   const uint32_t *colors, uint16_t clut_x, uint16_t clut_y,
+                                   uint16_t texpage, int raw_texture) {
+    int64_t area2 = (int64_t)(xs[1] - xs[0]) * (int64_t)(ys[2] - ys[0])
+                  - (int64_t)(xs[2] - xs[0]) * (int64_t)(ys[1] - ys[0]);
+    if (area2 == 0) { precise_consumed(); return; }
+
+#ifdef PSX_MACOS_METAL_RASTERIZER
+    if (metal_textured_triangle(xs, ys, us, vs, colors, clut_x, clut_y, texpage, raw_texture)) {
+        precise_consumed();
+        return;
+    }
+#endif
+    METAL_BATCH_SYNC();
+    if (g_texture_filter) sw_tri_uv_limits(xs, ys, us, vs);
+
+    const int shaded = colors != NULL;
+    TexVerts v = tex_verts(xs, ys, us, vs, colors);
+    RTarget n = rt_native();
+    if (tex_sort(&v))
+        raster_tex_triangle(&n, &v, shaded, clut_x, clut_y, texpage, raw_texture,
+                            g_perspective_valid);
+    if (g_hr) {
+        int s = g_scale, hx[3], hy[3];
+        for (int i = 0; i < 3; ++i) {
+            hx[i] = precise_scaled(0, i, xs[i], s);
+            hy[i] = precise_scaled(1, i, ys[i], s);
+        }
+        RTarget hr = rt_hires();
+        TexVerts h = tex_verts(hx, hy, us, vs, colors);
+        if (tex_sort(&h))
+            raster_tex_triangle(&hr, &h, shaded, clut_x, clut_y, texpage, raw_texture,
+                                g_perspective_valid);
+    }
+    if (g_wide_cur) {
+        int s = g_scale, dx = wide_dx(), wx[3], wy[3];
+        RTarget wt = rt_wide();
+        WideBd bd = wide_bd_get();
+        for (int i = 0; i < 3; ++i) {
+            wx[i] = precise_wide_x(i, xs[i], s, dx, &bd);
+            wy[i] = precise_scaled(1, i, ys[i], s);
+        }
+        TexVerts w = tex_verts(wx, wy, us, vs, colors);
+        if (tex_sort(&w))
+            raster_tex_triangle(&wt, &w, shaded, clut_x, clut_y, texpage, raw_texture,
+                                g_perspective_valid);
+    }
+    precise_consumed();
+}
+
+void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
+                               int x1, int y1, int u1, int v1,
+                               int x2, int y2, int u2, int v2,
+                               uint16_t clut_x, uint16_t clut_y,
+                               uint16_t texpage) {
+    const int xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
+    const int us[3] = {u0, u1, u2}, vs[3] = {v0, v1, v2};
+    draw_textured_triangle(xs, ys, us, vs, NULL, clut_x, clut_y, texpage, g_raw_texture);
 }
 
 void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
@@ -1806,51 +1842,10 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
                                       uint32_t color2,
                                       uint16_t clut_x, uint16_t clut_y,
                                       uint16_t texpage, int raw_texture) {
-    METAL_BATCH_SYNC();
-    int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
-                  - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
-    if (area2 == 0) { precise_consumed(); return; }
-
-    if (g_texture_filter) {
-        int xs[3] = {x0,x1,x2}, ys[3] = {y0,y1,y2};
-        int us[3] = {u0,u1,u2}, vs[3] = {v0,v1,v2};
-        sw_tri_uv_limits(xs, ys, us, vs);
-    }
-
-    int r0, g0, b0, r1, g1, b1, r2, g2, b2;
-    color24_to_mod(color0, &r0, &g0, &b0);
-    color24_to_mod(color1, &r1, &g1, &b1);
-    color24_to_mod(color2, &r2, &g2, &b2);
-
-    RTarget n = rt_native();
-    raster_shaded_textured_triangle(&n,
-        x0, y0, u0, v0, r0, g0, b0,
-        x1, y1, u1, v1, r1, g1, b1,
-        x2, y2, u2, v2, r2, g2, b2,
-        clut_x, clut_y, texpage, raw_texture, g_perspective_valid,
-        g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
-    if (g_hr) {
-        int s = g_scale;
-        RTarget hr = rt_hires();
-        raster_shaded_textured_triangle(&hr,
-            precise_scaled(0,0,x0,s), precise_scaled(1,0,y0,s), u0, v0, r0, g0, b0,
-            precise_scaled(0,1,x1,s), precise_scaled(1,1,y1,s), u1, v1, r1, g1, b1,
-            precise_scaled(0,2,x2,s), precise_scaled(1,2,y2,s), u2, v2, r2, g2, b2,
-            clut_x, clut_y, texpage, raw_texture, g_perspective_valid,
-            g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
-    }
-    if (g_wide_cur) {
-        int s = g_scale, dx = wide_dx();
-        RTarget wt = rt_wide();
-        WideBd bd = wide_bd_get();
-        raster_shaded_textured_triangle(&wt,
-            precise_wide_x(0,x0,s,dx,&bd), precise_scaled(1,0,y0,s), u0, v0, r0, g0, b0,
-            precise_wide_x(1,x1,s,dx,&bd), precise_scaled(1,1,y1,s), u1, v1, r1, g1, b1,
-            precise_wide_x(2,x2,s,dx,&bd), precise_scaled(1,2,y2,s), u2, v2, r2, g2, b2,
-            clut_x, clut_y, texpage, raw_texture, g_perspective_valid,
-            g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
-    }
-    precise_consumed();
+    const int xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
+    const int us[3] = {u0, u1, u2}, vs[3] = {v0, v1, v2};
+    const uint32_t colors[3] = {color0, color1, color2};
+    draw_textured_triangle(xs, ys, us, vs, colors, clut_x, clut_y, texpage, raw_texture);
 }
 
 /* ------------------------------------------------------------------ */
